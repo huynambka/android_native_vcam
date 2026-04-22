@@ -1,11 +1,13 @@
 package com.namnh.awesomecam
 
 import android.os.Bundle
+import android.os.Build
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import java.io.File
+import java.util.zip.ZipFile
 import kotlin.concurrent.thread
 
 class InjectorActivity : AppCompatActivity() {
@@ -29,7 +31,7 @@ class InjectorActivity : AppCompatActivity() {
         logText = findViewById(R.id.logText)
         logScroll = findViewById(R.id.logScroll)
 
-        statusText.text = "Idle\n\nRequired assets: " + (listOf(HELPER_ASSET, AGENT_ASSET) + PAYLOAD_ASSETS).joinToString(", ")
+        statusText.text = "Idle\n\nRequired assets: $HELPER_ASSET, $AGENT_ASSET, $SHADOWHOOK_LIB_NAME\nInject target: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME"
         logText.text = LOGCAT_PLACEHOLDER
 
         val injectButton: Button = findViewById(R.id.injectButton)
@@ -40,14 +42,15 @@ class InjectorActivity : AppCompatActivity() {
                 appendStatus("Preparing runtime files")
                 val localHelper = extractAsset(HELPER_ASSET)
                 val localAgent = extractAsset(AGENT_ASSET)
-                val localPayloads = PAYLOAD_ASSETS.map(::extractAsset)
+                val localShadowHook = extractBundledNativeLib(SHADOWHOOK_LIB_NAME)
 
                 appendStatus(
                     "App-private staging ready:\n" +
-                        (listOf(localHelper.absolutePath, localAgent.absolutePath) + localPayloads.map { it.absolutePath })
+                        (listOf(localHelper.absolutePath, localAgent.absolutePath) +
+                            listOf(localShadowHook.absolutePath))
                             .joinToString("\n")
                 )
-                val commands = buildRuntimeCommands(localHelper, localAgent, localPayloads)
+                val commands = buildRuntimeCommands(localHelper, localAgent, localShadowHook)
 
                 appendStatus("Running injector as root")
                 appendStatus(runRoot(commands))
@@ -92,26 +95,48 @@ class InjectorActivity : AppCompatActivity() {
         return outFile
     }
 
-    private fun buildRuntimeCommands(helper: File, agent: File, payloads: List<File>): List<String> {
+    private fun extractBundledNativeLib(libName: String): File {
+        val outFile = File(filesDir, libName)
+
+        val abiCandidates = buildList {
+            addAll(Build.SUPPORTED_ABIS.map { abi -> "lib/$abi/$libName" })
+            add("lib/arm64-v8a/$libName")
+            add("lib/armeabi-v7a/$libName")
+            add("lib/x86_64/$libName")
+            add("lib/x86/$libName")
+        }.distinct()
+
+        ZipFile(applicationInfo.sourceDir).use { zip ->
+            val entry = abiCandidates
+                .asSequence()
+                .mapNotNull { path -> zip.getEntry(path) }
+                .firstOrNull()
+                ?: error("Missing bundled native lib in APK: $libName")
+
+            zip.getInputStream(entry).use { input ->
+                outFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+        }
+
+        return outFile
+    }
+
+    private fun buildRuntimeCommands(helper: File, agent: File, shadowHook: File): List<String> {
         val helperDst = "$RUNTIME_DIR/$HELPER_ASSET"
         val agentDst = "$RUNTIME_DIR/$AGENT_ASSET"
-        val injectPayloadDst = "$RUNTIME_DIR/$INJECT_PAYLOAD_ASSET"
+        val shadowHookDst = "$RUNTIME_DIR/$SHADOWHOOK_LIB_NAME"
 
         return buildList {
             add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
             add("cp ${shellQuote(helper.absolutePath)} ${shellQuote(helperDst)}")
             add("cp ${shellQuote(agent.absolutePath)} ${shellQuote(agentDst)}")
+            add("cp ${shellQuote(shadowHook.absolutePath)} ${shellQuote(shadowHookDst)}")
             add("chmod 0755 ${shellQuote(helperDst)}")
-            add("chmod 0644 ${shellQuote(agentDst)}")
-
-            for (payload in payloads) {
-                val payloadDst = "$RUNTIME_DIR/${payload.name}"
-                add("cp ${shellQuote(payload.absolutePath)} ${shellQuote(payloadDst)}")
-                add("chmod 0644 ${shellQuote(payloadDst)}")
-                add("chcon u:object_r:system_lib_file:s0 ${shellQuote(payloadDst)}")
-            }
-
-            add("sh -c \"$helperDst cameraserver $injectPayloadDst\"")
+            add("chmod 0644 ${shellQuote(agentDst)} ${shellQuote(shadowHookDst)}")
+            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(shadowHookDst)}")
+            add("sh -c \"$helperDst cameraserver $shadowHookDst\"")
         }
     }
 
@@ -238,11 +263,6 @@ class InjectorActivity : AppCompatActivity() {
         private const val RUNTIME_DIR = "/data/camera"
         private const val HELPER_ASSET = "injector_helper"
         private const val AGENT_ASSET = "agent.js"
-        private const val INJECT_PAYLOAD_ASSET = "libproxy.so"
-        private const val TEST_ASSET = "libtest.so"
-        private val PAYLOAD_ASSETS = listOf(
-            INJECT_PAYLOAD_ASSET,
-            TEST_ASSET,
-        )
+        private const val SHADOWHOOK_LIB_NAME = "libshadowhook.so"
     }
 }

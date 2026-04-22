@@ -16,18 +16,6 @@ set_target_properties(injector_helper PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
 )
 
-add_library(proxy SHARED proxy.cpp)
-set_target_properties(proxy PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
-    OUTPUT_NAME "proxy"
-)
-
-add_library(test SHARED test.cpp)
-set_target_properties(test PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
-    OUTPUT_NAME "test"
-)
-
 find_library(log-lib log)
 find_library(dl-lib dl)
 find_library(m-lib m)
@@ -38,4 +26,3 @@ target_compile_options(injector_helper PRIVATE -ffunction-sections -fdata-sectio
 target_link_options(injector_helper PRIVATE -Wl,--export-dynamic -Wl,--gc-sections -pthread)
 
 target_link_libraries(injector_helper frida-core ${log-lib} ${dl-lib} ${m-lib})
-target_link_libraries(proxy ${log-lib})
