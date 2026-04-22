@@ -29,7 +29,7 @@ class InjectorActivity : AppCompatActivity() {
         logText = findViewById(R.id.logText)
         logScroll = findViewById(R.id.logScroll)
 
-        statusText.text = "Idle\n\nRequired assets: injector_helper, agent.js, libtest_inject.so"
+        statusText.text = "Idle\n\nRequired assets: " + (listOf(HELPER_ASSET, AGENT_ASSET) + PAYLOAD_ASSETS).joinToString(", ")
         logText.text = LOGCAT_PLACEHOLDER
 
         val injectButton: Button = findViewById(R.id.injectButton)
@@ -40,10 +40,14 @@ class InjectorActivity : AppCompatActivity() {
                 appendStatus("Preparing runtime files")
                 val localHelper = extractAsset(HELPER_ASSET)
                 val localAgent = extractAsset(AGENT_ASSET)
-                val localPayload = extractAsset(PAYLOAD_ASSET)
+                val localPayloads = PAYLOAD_ASSETS.map(::extractAsset)
 
-                appendStatus("App-private staging ready:\n${localHelper.absolutePath}\n${localAgent.absolutePath}\n${localPayload.absolutePath}")
-                val commands = buildRuntimeCommands(localHelper, localAgent, localPayload)
+                appendStatus(
+                    "App-private staging ready:\n" +
+                        (listOf(localHelper.absolutePath, localAgent.absolutePath) + localPayloads.map { it.absolutePath })
+                            .joinToString("\n")
+                )
+                val commands = buildRuntimeCommands(localHelper, localAgent, localPayloads)
 
                 appendStatus("Running injector as root")
                 appendStatus(runRoot(commands))
@@ -88,21 +92,27 @@ class InjectorActivity : AppCompatActivity() {
         return outFile
     }
 
-    private fun buildRuntimeCommands(helper: File, agent: File, payload: File): List<String> {
+    private fun buildRuntimeCommands(helper: File, agent: File, payloads: List<File>): List<String> {
         val helperDst = "$RUNTIME_DIR/$HELPER_ASSET"
         val agentDst = "$RUNTIME_DIR/$AGENT_ASSET"
-        val payloadDst = "$RUNTIME_DIR/$PAYLOAD_ASSET"
+        val injectPayloadDst = "$RUNTIME_DIR/$INJECT_PAYLOAD_ASSET"
 
-        return listOf(
-            "mkdir -p ${shellQuote(RUNTIME_DIR)}",
-            "cp ${shellQuote(helper.absolutePath)} ${shellQuote(helperDst)}",
-            "cp ${shellQuote(agent.absolutePath)} ${shellQuote(agentDst)}",
-            "cp ${shellQuote(payload.absolutePath)} ${shellQuote(payloadDst)}",
-            "chmod 0755 ${shellQuote(helperDst)}",
-            "chmod 0644 ${shellQuote(agentDst)} ${shellQuote(payloadDst)}",
-            "chcon u:object_r:system_lib_file:s0 ${shellQuote(payloadDst)}",
-            "sh -c \"selinux=${'$'}(getenforce 2>/dev/null || echo Unknown); echo SELinux=${'$'}selinux; if [ \\\"${'$'}selinux\\\" = Enforcing ]; then setenforce 0; fi; \\\"$helperDst\\\" cameraserver \\\"$payloadDst\\\"; rc=${'$'}?; if [ \\\"${'$'}selinux\\\" = Enforcing ]; then setenforce 1; fi; exit ${'$'}rc\""
-        )
+        return buildList {
+            add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
+            add("cp ${shellQuote(helper.absolutePath)} ${shellQuote(helperDst)}")
+            add("cp ${shellQuote(agent.absolutePath)} ${shellQuote(agentDst)}")
+            add("chmod 0755 ${shellQuote(helperDst)}")
+            add("chmod 0644 ${shellQuote(agentDst)}")
+
+            for (payload in payloads) {
+                val payloadDst = "$RUNTIME_DIR/${payload.name}"
+                add("cp ${shellQuote(payload.absolutePath)} ${shellQuote(payloadDst)}")
+                add("chmod 0644 ${shellQuote(payloadDst)}")
+                add("chcon u:object_r:system_lib_file:s0 ${shellQuote(payloadDst)}")
+            }
+
+            add("sh -c \"$helperDst cameraserver $injectPayloadDst\"")
+        }
     }
 
     private fun runRoot(commands: List<String>): String {
@@ -225,9 +235,14 @@ class InjectorActivity : AppCompatActivity() {
         private const val LOGCAT_PLACEHOLDER = "Waiting for logcat..."
         private const val LOGCAT_COMMAND = "logcat -v time -s awesomeCAM:I *:S"
         private const val MAX_OUTPUT_CHARS = 16000
-        private const val RUNTIME_DIR = "/data/local/tmp/awesomeCAM"
+        private const val RUNTIME_DIR = "/data/camera"
         private const val HELPER_ASSET = "injector_helper"
         private const val AGENT_ASSET = "agent.js"
-        private const val PAYLOAD_ASSET = "libtest_inject.so"
+        private const val INJECT_PAYLOAD_ASSET = "libproxy.so"
+        private const val TEST_ASSET = "libtest.so"
+        private val PAYLOAD_ASSETS = listOf(
+            INJECT_PAYLOAD_ASSET,
+            TEST_ASSET,
+        )
     }
 }

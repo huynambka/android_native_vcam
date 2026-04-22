@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(vcam_injector)
+project(awesomeCAM)
 
 set(FRIDA_CORE_DIR "${CMAKE_SOURCE_DIR}/../../../../third_party/frida-core-devkit")
 if (NOT EXISTS "${FRIDA_CORE_DIR}/frida-core.h" OR NOT EXISTS "${FRIDA_CORE_DIR}/libfrida-core.a")
@@ -16,10 +16,16 @@ set_target_properties(injector_helper PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
 )
 
-add_library(test_inject SHARED test_inject.cpp)
-set_target_properties(test_inject PROPERTIES
+add_library(proxy SHARED proxy.cpp)
+set_target_properties(proxy PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
-    OUTPUT_NAME "test_inject"
+    OUTPUT_NAME "proxy"
+)
+
+add_library(test SHARED test.cpp)
+set_target_properties(test PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
+    OUTPUT_NAME "test"
 )
 
 find_library(log-lib log)
@@ -32,4 +38,4 @@ target_compile_options(injector_helper PRIVATE -ffunction-sections -fdata-sectio
 target_link_options(injector_helper PRIVATE -Wl,--export-dynamic -Wl,--gc-sections -pthread)
 
 target_link_libraries(injector_helper frida-core ${log-lib} ${dl-lib} ${m-lib})
-target_link_libraries(test_inject ${log-lib})
+target_link_libraries(proxy ${log-lib})
