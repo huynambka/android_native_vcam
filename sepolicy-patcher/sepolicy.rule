@@ -1,6 +1,7 @@
 # Frida's Android SELinux patch creates these two types:
 type frida_file { file_type mlstrustedobject }
 type frida_memfd { file_type mlstrustedobject }
+type awesomecam_source_file { file_type mlstrustedobject }
 
 # Core Frida rules from frida-core/lib/selinux/patch.c.
 allow domain domain process execmem
@@ -35,3 +36,9 @@ allow domain default_android_service service_manager find
 allow domain su unix_stream_socket { connectto read write getattr getopt }
 allow domain su fd use
 allow domain su process sigchld
+
+# Allow awesomeCAM app to directly read /data/camera/input.mp4 relabeled as
+# awesomecam_source_file.
+allow untrusted_app system_data_root_file dir search
+allow untrusted_app system_data_file dir { search open read getattr }
+allow untrusted_app awesomecam_source_file file { open read getattr map }

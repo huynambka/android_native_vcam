@@ -3,6 +3,7 @@
 #include <android/binder_ibinder.h>
 #include <android/binder_parcel.h>
 #include <android/log.h>
+#include <dlfcn.h>
 #include <pthread.h>
 
 #include <atomic>
@@ -39,8 +40,107 @@ BinderRuntimeApi g_binder_runtime;
 std::atomic<bool> g_service_started{false};
 std::atomic<bool> g_service_registered{false};
 std::atomic<bool> g_service_launching{false};
+std::atomic<bool> g_probe_c51_launching{false};
+std::atomic<bool> g_probe_c52_launching{false};
 AIBinder_Class *g_service_class = nullptr;
 AIBinder *g_service_binder = nullptr;
+
+struct ClassicBinderRuntimeApi {
+  void *handle = nullptr;
+  void *sym_process_state_self = nullptr;
+  void *sym_process_state_start_thread_pool = nullptr;
+  void *sym_ipc_thread_state_self = nullptr;
+  void *sym_ipc_thread_state_join_thread_pool = nullptr;
+};
+
+ClassicBinderRuntimeApi g_classic_binder_runtime;
+std::atomic<bool> g_probe_c61_launching{false};
+std::atomic<bool> g_probe_c62_launching{false};
+
+struct OpaqueStrongPointer {
+  void *ptr = nullptr;
+};
+
+using FnProcessStateStartThreadPool = void (*)(void *);
+using FnIPCThreadStateSelf = void *(*)();
+using FnIPCThreadStateJoinThreadPool = void (*)(void *, bool);
+
+bool LoadClassicBinderRuntimeApi(ClassicBinderRuntimeApi *api) {
+  if (api == nullptr) return false;
+  if (api->handle != nullptr) {
+    return api->sym_process_state_self != nullptr &&
+           api->sym_process_state_start_thread_pool != nullptr &&
+           api->sym_ipc_thread_state_self != nullptr &&
+           api->sym_ipc_thread_state_join_thread_pool != nullptr;
+  }
+  api->handle = dlopen("libbinder.so", RTLD_NOW | RTLD_LOCAL);
+  if (api->handle == nullptr) {
+    LOGE("ClassicBinder: dlopen(libbinder.so) failed: %s", dlerror() ? dlerror() : "unknown");
+    return false;
+  }
+  api->sym_process_state_self = dlsym(api->handle, "_ZN7android12ProcessState4selfEv");
+  api->sym_process_state_start_thread_pool = dlsym(api->handle, "_ZN7android12ProcessState15startThreadPoolEv");
+  api->sym_ipc_thread_state_self = dlsym(api->handle, "_ZN7android14IPCThreadState4selfEv");
+  api->sym_ipc_thread_state_join_thread_pool = dlsym(api->handle, "_ZN7android14IPCThreadState14joinThreadPoolEb");
+  const bool ok = api->sym_process_state_self != nullptr &&
+                  api->sym_process_state_start_thread_pool != nullptr &&
+                  api->sym_ipc_thread_state_self != nullptr &&
+                  api->sym_ipc_thread_state_join_thread_pool != nullptr;
+  if (!ok) {
+    LOGE("ClassicBinder: missing required symbols self=%p start=%p ipcSelf=%p join=%p",
+         api->sym_process_state_self, api->sym_process_state_start_thread_pool,
+         api->sym_ipc_thread_state_self, api->sym_ipc_thread_state_join_thread_pool);
+  }
+  return ok;
+}
+
+bool CallHiddenResultNoArg(void *fn, void *out) {
+#if defined(__aarch64__)
+  asm volatile(
+      "mov x8, %x[out]\n"
+      "blr %x[fn]\n"
+      :
+      : [fn] "r"(fn), [out] "r"(out)
+      : "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
+        "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x30", "memory", "cc");
+  return true;
+#else
+  (void)fn;
+  (void)out;
+  return false;
+#endif
+}
+
+bool GetClassicProcessState(OpaqueStrongPointer *out) {
+  if (out == nullptr) return false;
+  out->ptr = nullptr;
+  if (!LoadClassicBinderRuntimeApi(&g_classic_binder_runtime)) return false;
+  if (!CallHiddenResultNoArg(g_classic_binder_runtime.sym_process_state_self, out)) return false;
+  return out->ptr != nullptr;
+}
+
+void StartClassicBinderThreadPool() {
+  OpaqueStrongPointer process_state{};
+  if (!GetClassicProcessState(&process_state)) {
+    LOGE("ClassicBinder: ProcessState::self() failed");
+    return;
+  }
+  LOGI("ClassicBinder: ProcessState ptr=%p", process_state.ptr);
+  reinterpret_cast<FnProcessStateStartThreadPool>(
+      g_classic_binder_runtime.sym_process_state_start_thread_pool)(process_state.ptr);
+  LOGI("ClassicBinder: ProcessState::startThreadPool() returned");
+  void *ipc = reinterpret_cast<FnIPCThreadStateSelf>(
+      g_classic_binder_runtime.sym_ipc_thread_state_self)();
+  LOGI("ClassicBinder: IPCThreadState ptr=%p", ipc);
+  if (ipc == nullptr) {
+    LOGE("ClassicBinder: IPCThreadState::self() failed");
+    return;
+  }
+  reinterpret_cast<FnIPCThreadStateJoinThreadPool>(
+      g_classic_binder_runtime.sym_ipc_thread_state_join_thread_pool)(ipc, true);
+  LOGI("ClassicBinder: IPCThreadState::joinThreadPool() returned");
+}
+
 
 bool ByteArrayAllocator(void *arrayData, int32_t length, int8_t **outBuffer) {
   if (arrayData == nullptr || outBuffer == nullptr) return false;
@@ -139,6 +239,278 @@ bool EnsureServiceClass() {
 }
 
 }  // namespace
+
+bool ProbeBinderRuntimeOnly() {
+  LOGI("Video2CameraService[C1]: loading binder runtime only");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
+    LOGE("Video2CameraService[C1]: failed to load binder runtime API");
+    return false;
+  }
+  LOGI("Video2CameraService[C1]: binder runtime loaded handle=%p", g_binder_runtime.handle);
+  return true;
+}
+
+bool ProbeBinderClassDefineOnly() {
+  LOGI("Video2CameraService[C2]: loading binder runtime");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
+    LOGE("Video2CameraService[C2]: failed to load binder runtime API");
+    return false;
+  }
+  LOGI("Video2CameraService[C2]: binder runtime loaded handle=%p", g_binder_runtime.handle);
+  LOGI("Video2CameraService[C2]: defining binder class only");
+  if (!EnsureServiceClass()) {
+    LOGE("Video2CameraService[C2]: failed to define service class");
+    return false;
+  }
+  LOGI("Video2CameraService[C2]: binder class=%p", g_service_class);
+  return true;
+}
+
+bool ProbeBinderNewOnly() {
+  LOGI("Video2CameraService[C3]: loading binder runtime");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
+    LOGE("Video2CameraService[C3]: failed to load binder runtime API");
+    return false;
+  }
+  LOGI("Video2CameraService[C3]: binder runtime loaded handle=%p", g_binder_runtime.handle);
+  LOGI("Video2CameraService[C3]: ensuring binder class");
+  if (!EnsureServiceClass()) {
+    LOGE("Video2CameraService[C3]: failed to define service class");
+    return false;
+  }
+  LOGI("Video2CameraService[C3]: creating binder instance only");
+  AIBinder *binder = g_binder_runtime.binder_new(g_service_class, nullptr);
+  if (binder == nullptr) {
+    LOGE("Video2CameraService[C3]: AIBinder_new failed");
+    return false;
+  }
+  LOGI("Video2CameraService[C3]: binder instance=%p", binder);
+  return true;
+}
+
+bool ProbeBinderThreadPoolOnly() {
+  LOGI("Video2CameraService[C4]: loading binder runtime");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
+    LOGE("Video2CameraService[C4]: failed to load binder runtime API");
+    return false;
+  }
+  LOGI("Video2CameraService[C4]: binder runtime loaded handle=%p", g_binder_runtime.handle);
+  LOGI("Video2CameraService[C4]: ensuring binder class");
+  if (!EnsureServiceClass()) {
+    LOGE("Video2CameraService[C4]: failed to define service class");
+    return false;
+  }
+  LOGI("Video2CameraService[C4]: creating binder instance");
+  AIBinder *binder = g_binder_runtime.binder_new(g_service_class, nullptr);
+  if (binder == nullptr) {
+    LOGE("Video2CameraService[C4]: AIBinder_new failed");
+    return false;
+  }
+  LOGI("Video2CameraService[C4]: binder instance=%p", binder);
+  LOGI("Video2CameraService[C4]: starting binder threadpool only");
+  g_binder_runtime.set_thread_pool_max(1);
+  g_binder_runtime.start_thread_pool();
+  LOGI("Video2CameraService[C4]: binder threadpool started");
+  return true;
+}
+
+namespace {
+void *ProbeC51WorkerMain(void *) {
+  LOGI("Video2CameraService[C51]: worker start");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
+    LOGE("Video2CameraService[C51]: failed to load binder runtime API");
+    g_probe_c51_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C51]: binder runtime loaded handle=%p", g_binder_runtime.handle);
+  if (!EnsureServiceClass()) {
+    LOGE("Video2CameraService[C51]: failed to define service class");
+    g_probe_c51_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C51]: creating binder instance");
+  AIBinder *binder = g_binder_runtime.binder_new(g_service_class, nullptr);
+  if (binder == nullptr) {
+    LOGE("Video2CameraService[C51]: AIBinder_new failed");
+    g_probe_c51_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C51]: binder instance=%p", binder);
+  LOGI("Video2CameraService[C51]: starting binder threadpool from worker");
+  g_binder_runtime.set_thread_pool_max(1);
+  g_binder_runtime.start_thread_pool();
+  LOGI("Video2CameraService[C51]: binder threadpool started");
+  g_probe_c51_launching.store(false);
+  return nullptr;
+}
+
+void *ProbeC52WorkerMain(void *) {
+  LOGI("Video2CameraService[C52]: worker start");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
+    LOGE("Video2CameraService[C52]: failed to load binder runtime API");
+    g_probe_c52_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C52]: binder runtime loaded handle=%p", g_binder_runtime.handle);
+  if (!EnsureServiceClass()) {
+    LOGE("Video2CameraService[C52]: failed to define service class");
+    g_probe_c52_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C52]: creating binder instance");
+  g_service_binder = g_binder_runtime.binder_new(g_service_class, nullptr);
+  if (g_service_binder == nullptr) {
+    LOGE("Video2CameraService[C52]: AIBinder_new failed");
+    g_probe_c52_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C52]: binder instance=%p", g_service_binder);
+  LOGI("Video2CameraService[C52]: starting binder threadpool from worker");
+  g_binder_runtime.set_thread_pool_max(1);
+  g_binder_runtime.start_thread_pool();
+  LOGI("Video2CameraService[C52]: binder threadpool started");
+  LOGI("Video2CameraService[C52]: adding service %s", kVideo2CameraServiceName);
+  const binder_status_t add_status =
+      g_binder_runtime.add_service(g_service_binder, kVideo2CameraServiceName);
+  if (add_status != STATUS_OK) {
+    LOGE("Video2CameraService[C52]: add_service failed status=%d", add_status);
+    g_probe_c52_launching.store(false);
+    return nullptr;
+  }
+  g_service_registered.store(true);
+  LOGI("Video2CameraService[C52]: registered as %s", kVideo2CameraServiceName);
+  g_probe_c52_launching.store(false);
+  return nullptr;
+}
+}  // namespace
+
+bool ProbeBinderThreadPoolWorkerOnly() {
+  bool expected = false;
+  if (!g_probe_c51_launching.compare_exchange_strong(expected, true)) {
+    LOGW("Video2CameraService[C51]: worker already launching");
+    return true;
+  }
+  pthread_t thread;
+  const int rc = pthread_create(&thread, nullptr, ProbeC51WorkerMain, nullptr);
+  if (rc != 0) {
+    LOGE("Video2CameraService[C51]: pthread_create failed rc=%d", rc);
+    g_probe_c51_launching.store(false);
+    return false;
+  }
+  pthread_detach(thread);
+  LOGI("Video2CameraService[C51]: worker launched");
+  return true;
+}
+
+bool ProbeBinderFullServiceWorkerAsync() {
+  bool expected = false;
+  if (!g_probe_c52_launching.compare_exchange_strong(expected, true)) {
+    LOGW("Video2CameraService[C52]: worker already launching");
+    return true;
+  }
+  pthread_t thread;
+  const int rc = pthread_create(&thread, nullptr, ProbeC52WorkerMain, nullptr);
+  if (rc != 0) {
+    LOGE("Video2CameraService[C52]: pthread_create failed rc=%d", rc);
+    g_probe_c52_launching.store(false);
+    return false;
+  }
+  pthread_detach(thread);
+  LOGI("Video2CameraService[C52]: worker launched");
+  return true;
+}
+
+namespace {
+void *ProbeC61WorkerMain(void *) {
+  LOGI("Video2CameraService[C61]: worker start");
+  if (!LoadClassicBinderRuntimeApi(&g_classic_binder_runtime)) {
+    LOGE("Video2CameraService[C61]: failed to load classic binder runtime");
+    g_probe_c61_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C61]: classic binder runtime loaded handle=%p",
+       g_classic_binder_runtime.handle);
+  StartClassicBinderThreadPool();
+  g_probe_c61_launching.store(false);
+  return nullptr;
+}
+
+void *ProbeC62WorkerMain(void *) {
+  LOGI("Video2CameraService[C62]: worker start");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
+    LOGE("Video2CameraService[C62]: failed to load binder runtime API");
+    g_probe_c62_launching.store(false);
+    return nullptr;
+  }
+  if (!EnsureServiceClass()) {
+    LOGE("Video2CameraService[C62]: failed to define service class");
+    g_probe_c62_launching.store(false);
+    return nullptr;
+  }
+  g_service_binder = g_binder_runtime.binder_new(g_service_class, nullptr);
+  if (g_service_binder == nullptr) {
+    LOGE("Video2CameraService[C62]: AIBinder_new failed");
+    g_probe_c62_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C62]: binder instance=%p", g_service_binder);
+  const binder_status_t add_status =
+      g_binder_runtime.add_service(g_service_binder, kVideo2CameraServiceName);
+  if (add_status != STATUS_OK) {
+    LOGE("Video2CameraService[C62]: add_service failed status=%d", add_status);
+    g_probe_c62_launching.store(false);
+    return nullptr;
+  }
+  g_service_registered.store(true);
+  LOGI("Video2CameraService[C62]: registered as %s", kVideo2CameraServiceName);
+  if (!LoadClassicBinderRuntimeApi(&g_classic_binder_runtime)) {
+    LOGE("Video2CameraService[C62]: failed to load classic binder runtime");
+    g_probe_c62_launching.store(false);
+    return nullptr;
+  }
+  LOGI("Video2CameraService[C62]: classic binder runtime loaded handle=%p",
+       g_classic_binder_runtime.handle);
+  StartClassicBinderThreadPool();
+  g_probe_c62_launching.store(false);
+  return nullptr;
+}
+}  // namespace
+
+bool ProbeClassicThreadPoolWorkerOnly() {
+  bool expected = false;
+  if (!g_probe_c61_launching.compare_exchange_strong(expected, true)) {
+    LOGW("Video2CameraService[C61]: worker already launching");
+    return true;
+  }
+  pthread_t thread;
+  const int rc = pthread_create(&thread, nullptr, ProbeC61WorkerMain, nullptr);
+  if (rc != 0) {
+    LOGE("Video2CameraService[C61]: pthread_create failed rc=%d", rc);
+    g_probe_c61_launching.store(false);
+    return false;
+  }
+  pthread_detach(thread);
+  LOGI("Video2CameraService[C61]: worker launched");
+  return true;
+}
+
+bool ProbeClassicServiceWorkerAsync() {
+  bool expected = false;
+  if (!g_probe_c62_launching.compare_exchange_strong(expected, true)) {
+    LOGW("Video2CameraService[C62]: worker already launching");
+    return true;
+  }
+  pthread_t thread;
+  const int rc = pthread_create(&thread, nullptr, ProbeC62WorkerMain, nullptr);
+  if (rc != 0) {
+    LOGE("Video2CameraService[C62]: pthread_create failed rc=%d", rc);
+    g_probe_c62_launching.store(false);
+    return false;
+  }
+  pthread_detach(thread);
+  LOGI("Video2CameraService[C62]: worker launched");
+  return true;
+}
 
 bool EnsureVideo2CameraServiceStarted() {
   bool expected = false;

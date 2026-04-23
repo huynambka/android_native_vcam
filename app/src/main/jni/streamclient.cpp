@@ -74,6 +74,11 @@ bool TransactSetFrameLocked(int width, int height, int format, const jbyte *data
                             jsize length, int32_t *outGeneration) {
   if (!EnsureConnectedLocked()) return false;
 
+  if (length > 900000) {
+    LOGW("streamclient: large binder frame %dx%d fmt=%d bytes=%d", width, height, format,
+         static_cast<int>(length));
+  }
+
   AParcel *in = nullptr;
   binder_status_t status = g_binder_runtime.binder_prepare_transaction(g_remote, &in);
   if (status != STATUS_OK || in == nullptr) {
@@ -96,7 +101,8 @@ bool TransactSetFrameLocked(int width, int height, int format, const jbyte *data
   AParcel *out = nullptr;
   status = g_binder_runtime.binder_transact(g_remote, kTxnSetFrame, &in, &out, 0);
   if (status != STATUS_OK) {
-    LOGE("streamclient: transact setFrame failed status=%d", status);
+    LOGE("streamclient: transact setFrame failed status=%d width=%d height=%d fmt=%d bytes=%d",
+         status, width, height, format, static_cast<int>(length));
     if (out != nullptr) g_binder_runtime.parcel_delete(out);
     return false;
   }

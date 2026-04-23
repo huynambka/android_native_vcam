@@ -36,7 +36,7 @@ class InjectorActivity : AppCompatActivity() {
         statusText.text =
             "Idle\n\nRequired assets: $HELPER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
                 "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
-                "Stage 2: $RUNTIME_DIR/$HOOK_ASSET\n\n" +
+                "Stage 2: $RUNTIME_DIR/$HOOK_ASSET (call main_hook)\n\n" +
                 "File fallback: $RUNTIME_DIR/source.meta or $RUNTIME_DIR/frames/*.i420|nv12|nv21\n" +
                 "Binder-fed MP4: ${Mp4FeedController.DEFAULT_VIDEO_PATH}"
         logText.text = LOGCAT_PLACEHOLDER
@@ -164,7 +164,7 @@ class InjectorActivity : AppCompatActivity() {
             add("chmod 0644 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
             add("chcon u:object_r:system_lib_file:s0 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
             add("sh -c \"$helperDst cameraserver $shadowHookDst\"")
-            add("sh -c \"$helperDst cameraserver $hookDst\"")
+            add("sh -c \"$helperDst cameraserver $hookDst main_hook\"")
         }
     }
 

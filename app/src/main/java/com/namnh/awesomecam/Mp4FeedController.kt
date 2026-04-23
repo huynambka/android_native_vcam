@@ -5,8 +5,10 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import java.io.File
+import java.io.FileInputStream
 import kotlin.concurrent.thread
 import kotlin.math.max
+import kotlin.math.sqrt
 
 class Mp4FeedController(
     private val postStatus: (String) -> Unit,
@@ -16,6 +18,9 @@ class Mp4FeedController(
 
     @Volatile
     private var worker: Thread? = null
+
+    @Volatile
+    private var lastBinderScaleNote: String? = null
 
     val isRunning: Boolean
         get() = running
@@ -29,15 +34,16 @@ class Mp4FeedController(
                     postStatus("Video feed: binder service unavailable. Inject hook first.")
                     return@thread
                 }
-                if (!File(path).exists()) {
-                    postStatus("Video feed: missing source $path")
+                val decodePath = prepareReadableSource(path)
+                if (!File(decodePath).exists()) {
+                    postStatus("Video feed: missing source $decodePath")
                     return@thread
                 }
-                postStatus("Video feed: decoding $path")
+                postStatus("Video feed: decoding $decodePath")
                 while (running) {
-                    decodeOneLoop(path)
+                    decodeOneLoop(decodePath)
                     if (running) {
-                        postStatus("Video feed: reached EOF, looping $path")
+                        postStatus("Video feed: reached EOF, looping $decodePath")
                     }
                 }
             } catch (t: Throwable) {
@@ -56,11 +62,20 @@ class Mp4FeedController(
         worker?.interrupt()
     }
 
+
+    private fun prepareReadableSource(path: String): String {
+        val source = File(path)
+        require(source.exists()) { "Missing source $path" }
+        return source.absolutePath
+    }
+
     private fun decodeOneLoop(path: String) {
         val extractor = MediaExtractor()
         var codec: MediaCodec? = null
+        var inputStream: FileInputStream? = null
         try {
-            extractor.setDataSource(path)
+            inputStream = FileInputStream(path)
+            extractor.setDataSource(inputStream.fd)
             val trackIndex = selectVideoTrack(extractor)
             require(trackIndex >= 0) { "No video track in $path" }
             extractor.selectTrack(trackIndex)
@@ -124,13 +139,20 @@ class Mp4FeedController(
                                 if (image != null) {
                                     image.use {
                                         val frame = imageToI420(it)
-                                        if (!VideoBridge.pushI420(it.width, it.height, frame)) {
+                                        val binderFrame = fitI420ForBinder(it.width, it.height, frame)
+                                        if (!VideoBridge.pushI420(
+                                                binderFrame.width,
+                                                binderFrame.height,
+                                                binderFrame.bytes,
+                                            )
+                                        ) {
                                             throw IllegalStateException("Binder pushFrame failed")
                                         }
                                         sentFrames += 1
                                         if (sentFrames <= 5 || sentFrames % 120 == 0) {
                                             postStatus(
-                                                "Video feed: pushed frame #$sentFrames ${it.width}x${it.height}",
+                                                "Video feed: pushed frame #$sentFrames " +
+                                                    "${binderFrame.width}x${binderFrame.height}",
                                             )
                                         }
                                     }
@@ -145,6 +167,7 @@ class Mp4FeedController(
         } finally {
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
+            runCatching { inputStream?.close() }
             runCatching { extractor.release() }
         }
     }
@@ -196,6 +219,133 @@ class Mp4FeedController(
         return out
     }
 
+    private data class BinderFrame(
+        val width: Int,
+        val height: Int,
+        val bytes: ByteArray,
+    )
+
+    private fun fitI420ForBinder(width: Int, height: Int, bytes: ByteArray): BinderFrame {
+        if (bytes.size <= MAX_BINDER_FRAME_BYTES) {
+            maybePostBinderScaleNote(null)
+            return BinderFrame(width, height, bytes)
+        }
+
+        val scale = sqrt(MAX_BINDER_FRAME_BYTES.toDouble() / bytes.size.toDouble())
+        var targetWidth = makeEven(max(2, (width * scale).toInt()))
+        var targetHeight = makeEven(max(2, (height * scale).toInt()))
+        if (targetWidth > width) targetWidth = makeEven(width)
+        if (targetHeight > height) targetHeight = makeEven(height)
+
+        while (targetWidth > 2 && targetHeight > 2 &&
+            i420Size(targetWidth, targetHeight) > MAX_BINDER_FRAME_BYTES
+        ) {
+            targetWidth = makeEven(max(2, targetWidth - 2))
+            targetHeight = makeEven(max(2, targetHeight - 2))
+        }
+
+        val scaled = scaleI420Nearest(bytes, width, height, targetWidth, targetHeight)
+        maybePostBinderScaleNote(
+            "Video feed: scaled frame for binder ${width}x${height} -> " +
+                "${targetWidth}x${targetHeight} (${scaled.size} bytes)",
+        )
+        return BinderFrame(targetWidth, targetHeight, scaled)
+    }
+
+    private fun maybePostBinderScaleNote(note: String?) {
+        if (lastBinderScaleNote == note) return
+        lastBinderScaleNote = note
+        if (note != null) postStatus(note)
+    }
+
+    private fun scaleI420Nearest(
+        src: ByteArray,
+        srcWidth: Int,
+        srcHeight: Int,
+        dstWidth: Int,
+        dstHeight: Int,
+    ): ByteArray {
+        val dst = ByteArray(i420Size(dstWidth, dstHeight))
+        val srcYSize = srcWidth * srcHeight
+        val srcChromaWidth = (srcWidth + 1) / 2
+        val srcChromaHeight = (srcHeight + 1) / 2
+        val srcChromaSize = srcChromaWidth * srcChromaHeight
+
+        val dstYSize = dstWidth * dstHeight
+        val dstChromaWidth = (dstWidth + 1) / 2
+        val dstChromaHeight = (dstHeight + 1) / 2
+        val dstChromaSize = dstChromaWidth * dstChromaHeight
+
+        scalePlaneNearest(
+            src = src,
+            srcOffset = 0,
+            srcWidth = srcWidth,
+            srcHeight = srcHeight,
+            srcStride = srcWidth,
+            dst = dst,
+            dstOffset = 0,
+            dstWidth = dstWidth,
+            dstHeight = dstHeight,
+            dstStride = dstWidth,
+        )
+        scalePlaneNearest(
+            src = src,
+            srcOffset = srcYSize,
+            srcWidth = srcChromaWidth,
+            srcHeight = srcChromaHeight,
+            srcStride = srcChromaWidth,
+            dst = dst,
+            dstOffset = dstYSize,
+            dstWidth = dstChromaWidth,
+            dstHeight = dstChromaHeight,
+            dstStride = dstChromaWidth,
+        )
+        scalePlaneNearest(
+            src = src,
+            srcOffset = srcYSize + srcChromaSize,
+            srcWidth = srcChromaWidth,
+            srcHeight = srcChromaHeight,
+            srcStride = srcChromaWidth,
+            dst = dst,
+            dstOffset = dstYSize + dstChromaSize,
+            dstWidth = dstChromaWidth,
+            dstHeight = dstChromaHeight,
+            dstStride = dstChromaWidth,
+        )
+        return dst
+    }
+
+    private fun scalePlaneNearest(
+        src: ByteArray,
+        srcOffset: Int,
+        srcWidth: Int,
+        srcHeight: Int,
+        srcStride: Int,
+        dst: ByteArray,
+        dstOffset: Int,
+        dstWidth: Int,
+        dstHeight: Int,
+        dstStride: Int,
+    ) {
+        for (y in 0 until dstHeight) {
+            val srcY = (y * srcHeight) / dstHeight
+            val srcRow = srcOffset + srcY * srcStride
+            val dstRow = dstOffset + y * dstStride
+            for (x in 0 until dstWidth) {
+                val srcX = (x * srcWidth) / dstWidth
+                dst[dstRow + x] = src[srcRow + srcX]
+            }
+        }
+    }
+
+    private fun i420Size(width: Int, height: Int): Int {
+        val chromaWidth = (width + 1) / 2
+        val chromaHeight = (height + 1) / 2
+        return width * height + 2 * chromaWidth * chromaHeight
+    }
+
+    private fun makeEven(value: Int): Int = if ((value and 1) == 0) value else value - 1
+
     private fun copyPlane(
         plane: Image.Plane,
         width: Int,
@@ -227,6 +377,7 @@ class Mp4FeedController(
     companion object {
         private const val DEFAULT_FPS = 30
         private const val TIMEOUT_US = 10_000L
+        private const val MAX_BINDER_FRAME_BYTES = 786_432
         const val DEFAULT_VIDEO_PATH: String = "/data/camera/input.mp4"
     }
 }

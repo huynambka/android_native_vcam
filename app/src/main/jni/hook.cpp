@@ -1439,35 +1439,85 @@ extern "C" __attribute__((naked, noinline)) void hook_create_configured_surface(
 #endif
 }
 
-extern "C" __attribute__((visibility("default"))) void main_hook() {
-  if (g_self_handle == nullptr) {
-    Dl_info self_info{};
-    if (dladdr(reinterpret_cast<void *>(&main_hook), &self_info) != 0 &&
-        self_info.dli_fname != nullptr) {
-      int flags = RTLD_NOW | RTLD_GLOBAL;
+namespace {
+void EnsureSelfPinned(const void *symbol_for_dladdr, const char *entry_name) {
+  if (g_self_handle != nullptr) return;
+  Dl_info self_info{};
+  if (dladdr(symbol_for_dladdr, &self_info) != 0 && self_info.dli_fname != nullptr) {
+    int flags = RTLD_NOW | RTLD_GLOBAL;
 #ifdef RTLD_NODELETE
-      flags |= RTLD_NODELETE;
+    flags |= RTLD_NODELETE;
 #endif
-      g_self_handle = dlopen(self_info.dli_fname, flags);
-      if (g_self_handle != nullptr) {
-        LOGI("main_hook: self-pinned %s handle=%p", self_info.dli_fname, g_self_handle);
-      } else {
-        LOGE("main_hook: self-pin failed for %s: %s", self_info.dli_fname,
-             dlerror() != nullptr ? dlerror() : "unknown");
-      }
+    g_self_handle = dlopen(self_info.dli_fname, flags);
+    if (g_self_handle != nullptr) {
+      LOGI("%s: self-pinned %s handle=%p", entry_name, self_info.dli_fname, g_self_handle);
     } else {
-      LOGE("main_hook: dladdr failed for self");
+      LOGE("%s: self-pin failed for %s: %s", entry_name, self_info.dli_fname,
+           dlerror() != nullptr ? dlerror() : "unknown");
     }
+  } else {
+    LOGE("%s: dladdr failed for self", entry_name);
   }
+}
+}
 
+extern "C" __attribute__((visibility("default"))) void main_hook_c61() {
+  EnsureSelfPinned(reinterpret_cast<void *>(&main_hook_c61), "main_hook_c61");
   bool expected = false;
-  if (!g_started.compare_exchange_strong(expected, true,
-                                         std::memory_order_acq_rel)) {
-    LOGI("main_hook: already installed");
+  if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    LOGI("main_hook[C61]: already ran");
     return;
   }
+  LOGI("main_hook[C61]: classic threadpool worker only");
+  const bool ok = awesomecam::ProbeClassicThreadPoolWorkerOnly();
+  LOGI("main_hook[C61]: ProbeClassicThreadPoolWorkerOnly => %s", ok ? "ok" : "fail");
+}
 
-  LOGI("main_hook: installing hook");
-  awesomecam::StartVideo2CameraServiceAsync();
+extern "C" __attribute__((visibility("default"))) void main_hook_c62() {
+  EnsureSelfPinned(reinterpret_cast<void *>(&main_hook_c62), "main_hook_c62");
+  bool expected = false;
+  if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    LOGI("main_hook[C62]: already ran");
+    return;
+  }
+  LOGI("main_hook[C62]: classic service worker async");
+  const bool ok = awesomecam::ProbeClassicServiceWorkerAsync();
+  LOGI("main_hook[C62]: ProbeClassicServiceWorkerAsync => %s", ok ? "ok" : "fail");
+}
+
+extern "C" __attribute__((visibility("default"))) void main_hook() {
+  EnsureSelfPinned(reinterpret_cast<void *>(&main_hook), "main_hook");
+  bool expected = false;
+  if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    LOGI("main_hook: already ran");
+    return;
+  }
+  LOGI("main_hook: install hooks + classic service worker async");
   install_hook();
+  const bool ok = awesomecam::ProbeClassicServiceWorkerAsync();
+  LOGI("main_hook: ProbeClassicServiceWorkerAsync => %s", ok ? "ok" : "fail");
+}
+
+extern "C" __attribute__((visibility("default"))) void main_hook_c51() {
+  EnsureSelfPinned(reinterpret_cast<void *>(&main_hook_c51), "main_hook_c51");
+  bool expected = false;
+  if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    LOGI("main_hook[C51]: already ran");
+    return;
+  }
+  LOGI("main_hook[C51]: threadpool worker only");
+  const bool ok = awesomecam::ProbeBinderThreadPoolWorkerOnly();
+  LOGI("main_hook[C51]: ProbeBinderThreadPoolWorkerOnly => %s", ok ? "ok" : "fail");
+}
+
+extern "C" __attribute__((visibility("default"))) void main_hook_c52() {
+  EnsureSelfPinned(reinterpret_cast<void *>(&main_hook_c52), "main_hook_c52");
+  bool expected = false;
+  if (!g_started.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+    LOGI("main_hook[C52]: already ran");
+    return;
+  }
+  LOGI("main_hook[C52]: full service worker async");
+  const bool ok = awesomecam::ProbeBinderFullServiceWorkerAsync();
+  LOGI("main_hook[C52]: ProbeBinderFullServiceWorkerAsync => %s", ok ? "ok" : "fail");
 }

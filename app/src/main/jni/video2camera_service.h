@@ -15,6 +15,14 @@ struct BinderFrameCopy {
 };
 
 bool EnsureVideo2CameraServiceStarted();
+bool ProbeBinderRuntimeOnly();
+bool ProbeBinderClassDefineOnly();
+bool ProbeBinderNewOnly();
+bool ProbeBinderThreadPoolOnly();
+bool ProbeBinderFullServiceWorkerAsync();
+bool ProbeBinderThreadPoolWorkerOnly();
+bool ProbeClassicServiceWorkerAsync();
+bool ProbeClassicThreadPoolWorkerOnly();
 void StartVideo2CameraServiceAsync();
 bool CopyLatestBinderFrame(BinderFrameCopy *out);
 void ClearLatestBinderFrame();
