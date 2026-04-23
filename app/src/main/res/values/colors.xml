@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="cyan_300">#8FF3FF</color>
+    <color name="cyan_400">#46E6FF</color>
+    <color name="cyan_500">#00CFEF</color>
+    <color name="cyan_700">#00A6C2</color>
+    <color name="cyan_900">#00343D</color>
+
+    <color name="yellow_300">#FFE45E</color>
+
+    <color name="page_bg_start">#F2FEFF</color>
+    <color name="page_bg_end">#DDF8FF</color>
+    <color name="paper">#FFFFFF</color>
+    <color name="ink">#101010</color>
+
+    <color name="terminal_bg">#121212</color>
+    <color name="terminal_text">#84F8FF</color>
+    <color name="text_dark_secondary">#36515C</color>
+
+    <color name="text_primary">#101010</color>
+    <color name="text_secondary">#36515C</color>
+    <color name="bg_surface">#FFFFFF</color>
+    <color name="bg_surface_alt">#FFFFFF</color>
+    <color name="bg_terminal">#121212</color>
+    <color name="bg_start">#F2FEFF</color>
+    <color name="bg_end">#DDF8FF</color>
+    <color name="stroke_soft">#101010</color>
+    <color name="stroke_bright">#101010</color>
+</resources>

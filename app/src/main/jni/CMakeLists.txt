@@ -11,9 +11,16 @@ set_target_properties(frida-core PROPERTIES
     IMPORTED_LOCATION "${FRIDA_CORE_DIR}/libfrida-core.a"
 )
 
+find_package(shadowhook REQUIRED CONFIG)
+
 add_executable(injector_helper injector.cpp injector_main.cpp)
 set_target_properties(injector_helper PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
+)
+
+add_library(hook SHARED hook.cpp)
+set_target_properties(hook PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/../assets"
 )
 
 find_library(log-lib log)
@@ -26,3 +33,4 @@ target_compile_options(injector_helper PRIVATE -ffunction-sections -fdata-sectio
 target_link_options(injector_helper PRIVATE -Wl,--export-dynamic -Wl,--gc-sections -pthread)
 
 target_link_libraries(injector_helper frida-core ${log-lib} ${dl-lib} ${m-lib})
+target_link_libraries(hook shadowhook::shadowhook ${log-lib} ${dl-lib})

@@ -1,3 +1,14 @@
 <resources>
     <string name="app_name">awesomeCAM</string>
+    <string name="hero_badge">neo brutal</string>
+    <string name="hero_tagline">cyan core</string>
+    <string name="hero_subtitle">Bold root injector for cameraserver with loud panels, thick borders, and live telemetry.</string>
+    <string name="chip_root">Root pipeline</string>
+    <string name="chip_live_log">Live logcat</string>
+    <string name="inject_button">Inject now</string>
+    <string name="reset_button">Restart daemon</string>
+    <string name="status_title">Execution status</string>
+    <string name="status_subtitle">Asset staging, root commands, and injector output.</string>
+    <string name="log_title">Live logcat</string>
+    <string name="log_subtitle">Filtered awesomeCAM logs from helper and payload.</string>
 </resources>

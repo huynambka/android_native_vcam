@@ -31,7 +31,10 @@ class InjectorActivity : AppCompatActivity() {
         logText = findViewById(R.id.logText)
         logScroll = findViewById(R.id.logScroll)
 
-        statusText.text = "Idle\n\nRequired assets: $HELPER_ASSET, $AGENT_ASSET, $SHADOWHOOK_LIB_NAME\nInject target: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME"
+        statusText.text =
+            "Idle\n\nRequired assets: $HELPER_ASSET, $AGENT_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
+                "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
+                "Stage 2: $RUNTIME_DIR/$HOOK_ASSET"
         logText.text = LOGCAT_PLACEHOLDER
 
         val injectButton: Button = findViewById(R.id.injectButton)
@@ -42,15 +45,16 @@ class InjectorActivity : AppCompatActivity() {
                 appendStatus("Preparing runtime files")
                 val localHelper = extractAsset(HELPER_ASSET)
                 val localAgent = extractAsset(AGENT_ASSET)
+                val localHook = extractAsset(HOOK_ASSET)
                 val localShadowHook = extractBundledNativeLib(SHADOWHOOK_LIB_NAME)
 
                 appendStatus(
                     "App-private staging ready:\n" +
-                        (listOf(localHelper.absolutePath, localAgent.absolutePath) +
+                        (listOf(localHelper.absolutePath, localAgent.absolutePath, localHook.absolutePath) +
                             listOf(localShadowHook.absolutePath))
                             .joinToString("\n")
                 )
-                val commands = buildRuntimeCommands(localHelper, localAgent, localShadowHook)
+                val commands = buildRuntimeCommands(localHelper, localAgent, localShadowHook, localHook)
 
                 appendStatus("Running injector as root")
                 appendStatus(runRoot(commands))
@@ -123,20 +127,23 @@ class InjectorActivity : AppCompatActivity() {
         return outFile
     }
 
-    private fun buildRuntimeCommands(helper: File, agent: File, shadowHook: File): List<String> {
+    private fun buildRuntimeCommands(helper: File, agent: File, shadowHook: File, hook: File): List<String> {
         val helperDst = "$RUNTIME_DIR/$HELPER_ASSET"
         val agentDst = "$RUNTIME_DIR/$AGENT_ASSET"
         val shadowHookDst = "$RUNTIME_DIR/$SHADOWHOOK_LIB_NAME"
+        val hookDst = "$RUNTIME_DIR/$HOOK_ASSET"
 
         return buildList {
             add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
             add("cp ${shellQuote(helper.absolutePath)} ${shellQuote(helperDst)}")
             add("cp ${shellQuote(agent.absolutePath)} ${shellQuote(agentDst)}")
             add("cp ${shellQuote(shadowHook.absolutePath)} ${shellQuote(shadowHookDst)}")
+            add("cp ${shellQuote(hook.absolutePath)} ${shellQuote(hookDst)}")
             add("chmod 0755 ${shellQuote(helperDst)}")
-            add("chmod 0644 ${shellQuote(agentDst)} ${shellQuote(shadowHookDst)}")
-            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(shadowHookDst)}")
+            add("chmod 0644 ${shellQuote(agentDst)} ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
+            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
             add("sh -c \"$helperDst cameraserver $shadowHookDst\"")
+            add("sh -c \"$helperDst cameraserver $hookDst\"")
         }
     }
 
@@ -263,6 +270,7 @@ class InjectorActivity : AppCompatActivity() {
         private const val RUNTIME_DIR = "/data/camera"
         private const val HELPER_ASSET = "injector_helper"
         private const val AGENT_ASSET = "agent.js"
+        private const val HOOK_ASSET = "libhook.so"
         private const val SHADOWHOOK_LIB_NAME = "libshadowhook.so"
     }
 }
