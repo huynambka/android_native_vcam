@@ -15,6 +15,7 @@ class InjectorActivity : AppCompatActivity() {
     private lateinit var statusScroll: ScrollView
     private lateinit var logText: TextView
     private lateinit var logScroll: ScrollView
+    private lateinit var feedController: Mp4FeedController
 
     @Volatile
     private var logcatProcess: Process? = null
@@ -30,41 +31,58 @@ class InjectorActivity : AppCompatActivity() {
         statusScroll = findViewById(R.id.statusScroll)
         logText = findViewById(R.id.logText)
         logScroll = findViewById(R.id.logScroll)
+        feedController = Mp4FeedController(::appendStatus)
 
         statusText.text =
-            "Idle\n\nRequired assets: $HELPER_ASSET, $AGENT_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
+            "Idle\n\nRequired assets: $HELPER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
                 "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
-                "Stage 2: $RUNTIME_DIR/$HOOK_ASSET"
+                "Stage 2: $RUNTIME_DIR/$HOOK_ASSET\n\n" +
+                "File fallback: $RUNTIME_DIR/source.meta or $RUNTIME_DIR/frames/*.i420|nv12|nv21\n" +
+                "Binder-fed MP4: ${Mp4FeedController.DEFAULT_VIDEO_PATH}"
         logText.text = LOGCAT_PLACEHOLDER
 
         val injectButton: Button = findViewById(R.id.injectButton)
+        val feedButton: Button = findViewById(R.id.feedButton)
         val resetButton: Button = findViewById(R.id.resetButton)
 
         injectButton.setOnClickListener {
             runAsync {
                 appendStatus("Preparing runtime files")
                 val localHelper = extractAsset(HELPER_ASSET)
-                val localAgent = extractAsset(AGENT_ASSET)
                 val localHook = extractAsset(HOOK_ASSET)
                 val localShadowHook = extractBundledNativeLib(SHADOWHOOK_LIB_NAME)
 
                 appendStatus(
                     "App-private staging ready:\n" +
-                        (listOf(localHelper.absolutePath, localAgent.absolutePath, localHook.absolutePath) +
+                        (listOf(localHelper.absolutePath, localHook.absolutePath) +
                             listOf(localShadowHook.absolutePath))
                             .joinToString("\n")
                 )
-                val commands = buildRuntimeCommands(localHelper, localAgent, localShadowHook, localHook)
+                val commands = buildRuntimeCommands(localHelper, localShadowHook, localHook)
 
                 appendStatus("Running injector as root")
                 appendStatus(runRoot(commands))
             }
         }
 
+        feedButton.setOnClickListener {
+            if (feedController.isRunning) {
+                appendStatus("Stopping MP4 feed")
+                feedController.stop()
+                feedButton.text = getString(R.string.feed_button_start)
+            } else {
+                appendStatus("Starting MP4 feed from ${Mp4FeedController.DEFAULT_VIDEO_PATH}")
+                feedController.start(Mp4FeedController.DEFAULT_VIDEO_PATH)
+                feedButton.text = getString(R.string.feed_button_stop)
+            }
+        }
+
         resetButton.setOnClickListener {
             runAsync {
                 appendStatus("Restarting cameraserver")
+                feedController.stop()
                 appendStatus(runRoot(listOf("pkill cameraserver || killall cameraserver || true")))
+                runOnUiThread { feedButton.text = getString(R.string.feed_button_start) }
             }
         }
     }
@@ -77,6 +95,11 @@ class InjectorActivity : AppCompatActivity() {
     override fun onStop() {
         stopLogcat()
         super.onStop()
+    }
+
+    override fun onDestroy() {
+        feedController.stop()
+        super.onDestroy()
     }
 
     private fun runAsync(block: () -> Unit) {
@@ -127,20 +150,18 @@ class InjectorActivity : AppCompatActivity() {
         return outFile
     }
 
-    private fun buildRuntimeCommands(helper: File, agent: File, shadowHook: File, hook: File): List<String> {
+    private fun buildRuntimeCommands(helper: File, shadowHook: File, hook: File): List<String> {
         val helperDst = "$RUNTIME_DIR/$HELPER_ASSET"
-        val agentDst = "$RUNTIME_DIR/$AGENT_ASSET"
         val shadowHookDst = "$RUNTIME_DIR/$SHADOWHOOK_LIB_NAME"
         val hookDst = "$RUNTIME_DIR/$HOOK_ASSET"
 
         return buildList {
             add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
             add("cp ${shellQuote(helper.absolutePath)} ${shellQuote(helperDst)}")
-            add("cp ${shellQuote(agent.absolutePath)} ${shellQuote(agentDst)}")
             add("cp ${shellQuote(shadowHook.absolutePath)} ${shellQuote(shadowHookDst)}")
             add("cp ${shellQuote(hook.absolutePath)} ${shellQuote(hookDst)}")
             add("chmod 0755 ${shellQuote(helperDst)}")
-            add("chmod 0644 ${shellQuote(agentDst)} ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
+            add("chmod 0644 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
             add("chcon u:object_r:system_lib_file:s0 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
             add("sh -c \"$helperDst cameraserver $shadowHookDst\"")
             add("sh -c \"$helperDst cameraserver $hookDst\"")
@@ -269,7 +290,6 @@ class InjectorActivity : AppCompatActivity() {
         private const val MAX_OUTPUT_CHARS = 16000
         private const val RUNTIME_DIR = "/data/camera"
         private const val HELPER_ASSET = "injector_helper"
-        private const val AGENT_ASSET = "agent.js"
         private const val HOOK_ASSET = "libhook.so"
         private const val SHADOWHOOK_LIB_NAME = "libshadowhook.so"
     }

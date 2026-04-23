@@ -14,6 +14,15 @@ chown root:root "$CAMDIR" 2>/dev/null || true
 # Put directory on a stable data label.
 chcon u:object_r:system_data_file:s0 "$CAMDIR" 2>/dev/null || true
 
+# Keep regular source data readable by cameraserver.
+for file in "$CAMDIR"/*; do
+  [ -e "$file" ] || continue
+  [ -d "$file" ] && continue
+  chmod 0644 "$file" 2>/dev/null || true
+  chown root:root "$file" 2>/dev/null || true
+  chcon u:object_r:system_data_file:s0 "$file" 2>/dev/null || true
+done
+
 # Any .so dropped here gets system_lib_file so cameraserver can dlopen/map it.
 for so in "$CAMDIR"/*.so; do
   [ -e "$so" ] || continue

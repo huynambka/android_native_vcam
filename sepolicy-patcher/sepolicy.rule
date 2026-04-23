@@ -29,6 +29,9 @@ allow cameraserver system_data_root_file dir search
 allow cameraserver system_data_file dir { search open read getattr }
 allow cameraserver system_lib_file file { open read getattr map execute }
 
+allow cameraserver default_android_service service_manager add
+allow domain default_android_service service_manager find
+
 allow domain su unix_stream_socket { connectto read write getattr getopt }
 allow domain su fd use
 allow domain su process sigchld

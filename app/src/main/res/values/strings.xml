@@ -7,6 +7,8 @@
     <string name="chip_live_log">Live logcat</string>
     <string name="inject_button">Inject now</string>
     <string name="reset_button">Restart daemon</string>
+    <string name="feed_button_start">Feed MP4</string>
+    <string name="feed_button_stop">Stop feed</string>
     <string name="status_title">Execution status</string>
     <string name="status_subtitle">Asset staging, root commands, and injector output.</string>
     <string name="log_title">Live logcat</string>
