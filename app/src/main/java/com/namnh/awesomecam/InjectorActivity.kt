@@ -1,9 +1,9 @@
 package com.namnh.awesomecam
 
-import android.os.Bundle
+import android.content.Intent
 import android.os.Build
+import android.os.Bundle
 import android.widget.Button
-import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import java.io.File
@@ -11,41 +11,37 @@ import java.util.zip.ZipFile
 import kotlin.concurrent.thread
 
 class InjectorActivity : AppCompatActivity() {
-    private lateinit var statusText: TextView
-    private lateinit var statusScroll: ScrollView
-    private lateinit var logText: TextView
-    private lateinit var logScroll: ScrollView
+    private lateinit var summaryText: TextView
     private lateinit var feedController: Mp4FeedController
+    private lateinit var feedButton: Button
 
-    @Volatile
-    private var logcatProcess: Process? = null
-
-    @Volatile
-    private var logcatThread: Thread? = null
+    private val listener = object : TelemetryStore.Listener {
+        override fun onTelemetryChanged(snapshot: TelemetryStore.Snapshot) {
+            runOnUiThread {
+                summaryText.text = buildSummary(snapshot.status)
+                feedButton.text = getString(
+                    if (feedController.isRunning) R.string.feed_button_stop else R.string.feed_button_start,
+                )
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_injector)
 
-        statusText = findViewById(R.id.statusText)
-        statusScroll = findViewById(R.id.statusScroll)
-        logText = findViewById(R.id.logText)
-        logScroll = findViewById(R.id.logScroll)
+        summaryText = findViewById(R.id.summaryText)
         feedController = Mp4FeedController(::appendStatus)
+        feedButton = findViewById(R.id.feedButton)
 
-        statusText.text =
+        TelemetryStore.setInitialStatusIfEmpty(
             "Idle\n\nRequired assets: $HELPER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
                 "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
                 "Stage 2: $RUNTIME_DIR/$HOOK_ASSET (call main_hook)\n\n" +
-                "File fallback: $RUNTIME_DIR/source.meta or $RUNTIME_DIR/frames/*.i420|nv12|nv21\n" +
-                "Binder-fed MP4: ${Mp4FeedController.DEFAULT_VIDEO_PATH}"
-        logText.text = LOGCAT_PLACEHOLDER
+                "File source: ${Mp4FeedController.DEFAULT_VIDEO_PATH}",
+        )
 
-        val injectButton: Button = findViewById(R.id.injectButton)
-        val feedButton: Button = findViewById(R.id.feedButton)
-        val resetButton: Button = findViewById(R.id.resetButton)
-
-        injectButton.setOnClickListener {
+        findViewById<Button>(R.id.injectButton).setOnClickListener {
             runAsync {
                 appendStatus("Preparing runtime files")
                 val localHelper = extractAsset(HELPER_ASSET)
@@ -56,7 +52,7 @@ class InjectorActivity : AppCompatActivity() {
                     "App-private staging ready:\n" +
                         (listOf(localHelper.absolutePath, localHook.absolutePath) +
                             listOf(localShadowHook.absolutePath))
-                            .joinToString("\n")
+                            .joinToString("\n"),
                 )
                 val commands = buildRuntimeCommands(localHelper, localShadowHook, localHook)
 
@@ -77,7 +73,7 @@ class InjectorActivity : AppCompatActivity() {
             }
         }
 
-        resetButton.setOnClickListener {
+        findViewById<Button>(R.id.resetButton).setOnClickListener {
             runAsync {
                 appendStatus("Restarting cameraserver")
                 feedController.stop()
@@ -85,15 +81,21 @@ class InjectorActivity : AppCompatActivity() {
                 runOnUiThread { feedButton.text = getString(R.string.feed_button_start) }
             }
         }
+
+        findViewById<Button>(R.id.openLogsButton).setOnClickListener {
+            startActivity(Intent(this, LogsActivity::class.java))
+        }
     }
 
     override fun onStart() {
         super.onStart()
-        startLogcat()
+        TelemetryStore.addListener(listener)
+        TelemetryStore.acquireLogcat()
     }
 
     override fun onStop() {
-        stopLogcat()
+        TelemetryStore.removeListener(listener)
+        TelemetryStore.releaseLogcat()
         super.onStop()
     }
 
@@ -110,6 +112,15 @@ class InjectorActivity : AppCompatActivity() {
                 appendStatus("Error: ${t.message}")
             }
         }
+    }
+
+    private fun appendStatus(message: String) {
+        TelemetryStore.appendStatus(message)
+    }
+
+    private fun buildSummary(status: String): String {
+        if (status.isBlank()) return getString(R.string.summary_placeholder)
+        return status.trim()
     }
 
     private fun extractAsset(name: String): File {
@@ -193,101 +204,11 @@ class InjectorActivity : AppCompatActivity() {
         }
     }
 
-    private fun startLogcat() {
-        if (logcatThread?.isAlive == true) {
-            return
-        }
-
-        val readerThread = thread(start = false, name = "logcat-reader") {
-            var process: Process? = null
-            try {
-                process = ProcessBuilder("su", "-c", LOGCAT_COMMAND)
-                    .redirectErrorStream(true)
-                    .start()
-                logcatProcess = process
-
-                process.inputStream.bufferedReader().use { reader ->
-                    while (true) {
-                        val line = reader.readLine() ?: break
-                        appendLogLine(line)
-                    }
-                }
-
-                val exitCode = process.waitFor()
-                if (logcatProcess === process && exitCode != 0) {
-                    appendLogLine("logcat exited with code $exitCode")
-                }
-            } catch (t: Throwable) {
-                if (logcatProcess === process) {
-                    appendLogLine("Logcat error: ${t.message}")
-                }
-            } finally {
-                if (logcatProcess === process) {
-                    logcatProcess = null
-                }
-                if (logcatThread === Thread.currentThread()) {
-                    logcatThread = null
-                }
-            }
-        }
-
-        logcatThread = readerThread
-        readerThread.start()
-    }
-
-    private fun stopLogcat() {
-        val process = logcatProcess
-        logcatProcess = null
-        logcatThread?.interrupt()
-        logcatThread = null
-        process?.destroy()
-    }
-
-    private fun appendStatus(message: String) {
-        runOnUiThread {
-            statusText.text = trimOutput(
-                buildString {
-                    if (statusText.text.isNotBlank()) {
-                        append(statusText.text)
-                        append("\n\n")
-                    }
-                    append(message)
-                }
-            )
-            statusScroll.post { statusScroll.fullScroll(ScrollView.FOCUS_DOWN) }
-        }
-    }
-
-    private fun appendLogLine(line: String) {
-        runOnUiThread {
-            val current = logText.text.toString()
-            logText.text = trimOutput(
-                if (current.isBlank() || current == LOGCAT_PLACEHOLDER) {
-                    line
-                } else {
-                    "$current\n$line"
-                }
-            )
-            logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
-        }
-    }
-
-    private fun trimOutput(text: String): String {
-        return if (text.length <= MAX_OUTPUT_CHARS) {
-            text
-        } else {
-            text.takeLast(MAX_OUTPUT_CHARS).trimStart()
-        }
-    }
-
     private fun shellQuote(value: String): String {
         return "'" + value.replace("'", "'\"'\"'") + "'"
     }
 
     companion object {
-        private const val LOGCAT_PLACEHOLDER = "Waiting for logcat..."
-        private const val LOGCAT_COMMAND = "logcat -v time -s awesomeCAM:I *:S"
-        private const val MAX_OUTPUT_CHARS = 16000
         private const val RUNTIME_DIR = "/data/camera"
         private const val HELPER_ASSET = "injector_helper"
         private const val HOOK_ASSET = "libhook.so"

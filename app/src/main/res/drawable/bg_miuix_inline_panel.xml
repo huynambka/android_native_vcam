@@ -1,0 +1,4 @@
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="@color/miuix_surface_alt" />
+    <corners android:radius="20dp" />
+</shape>

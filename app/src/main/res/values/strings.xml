@@ -1,16 +1,25 @@
 <resources>
     <string name="app_name">awesomeCAM</string>
-    <string name="hero_badge">neo brutal</string>
-    <string name="hero_tagline">cyan core</string>
-    <string name="hero_subtitle">Bold root injector for cameraserver with loud panels, thick borders, and live telemetry.</string>
-    <string name="chip_root">Root pipeline</string>
-    <string name="chip_live_log">Live logcat</string>
-    <string name="inject_button">Inject now</string>
-    <string name="reset_button">Restart daemon</string>
-    <string name="feed_button_start">Feed MP4</string>
-    <string name="feed_button_stop">Stop feed</string>
+    <string name="miuix_badge">MIUIX shell</string>
+    <string name="miuix_home_subtitle">Cleaner control surface for cameraserver injection, MP4 feeding, and live diagnostics.</string>
+    <string name="miuix_pipeline_title">Pipeline overview</string>
+    <string name="miuix_pipeline_subtitle">Inject the payload, stream decoded MP4 frames, and inspect status or logcat in the dedicated telemetry screen.</string>
+    <string name="miuix_logs_card_title">Live telemetry</string>
+    <string name="miuix_logs_card_subtitle">The status block and logcat block now live in a separate screen so the main control surface stays clean.</string>
+    <string name="summary_placeholder">No execution status yet.</string>
+    <string name="inject_button">Inject</string>
+    <string name="reset_button">Restart service</string>
+    <string name="feed_button_start">Start MP4 feed</string>
+    <string name="feed_button_stop">Stop MP4 feed</string>
+    <string name="open_logs_button">Show logs</string>
+    <string name="logs_activity_title">Telemetry</string>
+    <string name="logs_activity_subtitle">Two live panels for execution status and filtered awesomeCAM logcat.</string>
+    <string name="logs_done_button">Done</string>
+    <string name="back_button">Back</string>
     <string name="status_title">Execution status</string>
-    <string name="status_subtitle">Asset staging, root commands, and injector output.</string>
+    <string name="status_subtitle">Asset staging, root shell commands, injector output, and feed progress.</string>
     <string name="log_title">Live logcat</string>
-    <string name="log_subtitle">Filtered awesomeCAM logs from helper and payload.</string>
+    <string name="log_subtitle">awesomeCAM helper, payload, and cameraserver logs.</string>
+    <string name="status_empty">Waiting for execution status…</string>
+    <string name="log_empty">Waiting for logcat…</string>
 </resources>
