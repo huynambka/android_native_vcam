@@ -1,4 +1,5 @@
 #include "video2camera_service.h"
+#include "video2camera_player.h"
 
 #include <android/binder_ibinder.h>
 #include <android/binder_parcel.h>
@@ -8,6 +9,7 @@
 
 #include <atomic>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "video2camera_ipc.h"
@@ -189,41 +191,56 @@ binder_status_t OnTransact(AIBinder *, transaction_code_t code, const AParcel *i
         return STATUS_BAD_VALUE;
       }
 
-      {
-        std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
-        g_shared_frame.width = width;
-        g_shared_frame.height = height;
-        g_shared_frame.format = format;
-        g_shared_frame.bytes.assign(reinterpret_cast<const uint8_t *>(incoming.data.data()),
-                                    reinterpret_cast<const uint8_t *>(incoming.data.data()) +
-                                        expected);
-        g_shared_frame.generation += 1;
-        g_shared_frame.push_count += 1;
-        if (g_shared_frame.push_count <= 5 || (g_shared_frame.push_count % 120) == 0) {
-          LOGI("Video2CameraService got frame #%llu %dx%d fmt=%d bytes=%zu gen=%llu",
-               static_cast<unsigned long long>(g_shared_frame.push_count), width, height,
-               format, g_shared_frame.bytes.size(),
-               static_cast<unsigned long long>(g_shared_frame.generation));
-        }
-        if (out != nullptr) {
-          g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(g_shared_frame.generation));
+      StopNativePlayback();
+      PublishDecodedI420Frame(
+          width, height,
+          std::vector<uint8_t>(reinterpret_cast<const uint8_t *>(incoming.data.data()),
+                               reinterpret_cast<const uint8_t *>(incoming.data.data()) + expected));
+      if (out != nullptr) {
+        BinderFrameState state{};
+        if (PeekLatestBinderFrameState(&state)) {
+          g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(state.generation));
         }
       }
       return STATUS_OK;
     }
     case kTxnClearFrame: {
-      {
-        std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
-        g_shared_frame.width = 0;
-        g_shared_frame.height = 0;
-        g_shared_frame.format = kFrameFormatUnknown;
-        g_shared_frame.bytes.clear();
-        g_shared_frame.generation += 1;
-        if (out != nullptr) {
-          g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(g_shared_frame.generation));
+      StopNativePlayback();
+      ClearLatestBinderFrame();
+      if (out != nullptr) {
+        BinderFrameState state{};
+        if (PeekLatestBinderFrameState(&state)) {
+          g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(state.generation));
+        } else {
+          g_binder_runtime.parcel_write_int32(out, 0);
         }
       }
       LOGI("Video2CameraService cleared cached frame");
+      return STATUS_OK;
+    }
+    case kTxnPlayFile: {
+      IncomingByteArray incoming;
+      binder_status_t status = g_binder_runtime.parcel_read_byte_array(in, &incoming, ByteArrayAllocator);
+      if (status != STATUS_OK) return status;
+      std::string path(incoming.data.begin(), incoming.data.end());
+      if (path.empty()) return STATUS_BAD_VALUE;
+      std::string error;
+      if (!StartNativePlayback(path, &error)) {
+        LOGE("Video2CameraService play failed for %s: %s", path.c_str(), error.c_str());
+        return STATUS_UNKNOWN_ERROR;
+      }
+      LOGI("Video2CameraService native playback started path=%s", path.c_str());
+      if (out != nullptr) {
+        g_binder_runtime.parcel_write_int32(out, 1);
+      }
+      return STATUS_OK;
+    }
+    case kTxnStopPlayback: {
+      StopNativePlayback();
+      if (out != nullptr) {
+        g_binder_runtime.parcel_write_int32(out, 1);
+      }
+      LOGI("Video2CameraService native playback stopped");
       return STATUS_OK;
     }
     default:
@@ -239,6 +256,23 @@ bool EnsureServiceClass() {
 }
 
 }  // namespace
+
+void PublishDecodedI420Frame(int32_t width, int32_t height, std::vector<uint8_t> &&bytes) {
+  if (width <= 0 || height <= 0 || bytes.empty()) return;
+  std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
+  g_shared_frame.width = width;
+  g_shared_frame.height = height;
+  g_shared_frame.format = kFrameFormatI420;
+  g_shared_frame.bytes = std::move(bytes);
+  g_shared_frame.generation += 1;
+  g_shared_frame.push_count += 1;
+  if (g_shared_frame.push_count <= 5 || (g_shared_frame.push_count % 120) == 0) {
+    LOGI("Video2CameraService publish decoded frame #%llu %dx%d bytes=%zu gen=%llu",
+         static_cast<unsigned long long>(g_shared_frame.push_count), width, height,
+         g_shared_frame.bytes.size(),
+         static_cast<unsigned long long>(g_shared_frame.generation));
+  }
+}
 
 bool ProbeBinderRuntimeOnly() {
   LOGI("Video2CameraService[C1]: loading binder runtime only");
@@ -596,6 +630,20 @@ bool CopyLatestBinderFrame(BinderFrameCopy *out) {
   out->format = g_shared_frame.format;
   out->generation = g_shared_frame.generation;
   out->bytes = g_shared_frame.bytes;
+  return true;
+}
+
+bool PeekLatestBinderFrameState(BinderFrameState *out) {
+  if (out == nullptr) return false;
+  std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
+  if (g_shared_frame.width <= 0 || g_shared_frame.height <= 0 ||
+      g_shared_frame.format != kFrameFormatI420 || g_shared_frame.bytes.empty()) {
+    return false;
+  }
+  out->width = g_shared_frame.width;
+  out->height = g_shared_frame.height;
+  out->format = g_shared_frame.format;
+  out->generation = g_shared_frame.generation;
   return true;
 }
 

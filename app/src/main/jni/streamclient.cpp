@@ -4,6 +4,7 @@
 #include <jni.h>
 
 #include <mutex>
+#include <cstring>
 #include <thread>
 #include <vector>
 #include <chrono>
@@ -121,6 +122,58 @@ bool TransactSetFrameLocked(int width, int height, int format, const jbyte *data
   return true;
 }
 
+bool TransactPlayFileLocked(const char *path, size_t path_length) {
+  if (path == nullptr || path_length == 0) return false;
+  if (!EnsureConnectedLocked()) return false;
+
+  AParcel *in = nullptr;
+  binder_status_t status = g_binder_runtime.binder_prepare_transaction(g_remote, &in);
+  if (status != STATUS_OK || in == nullptr) {
+    LOGE("streamclient: prepareTransaction(play) failed status=%d", status);
+    return false;
+  }
+
+  status = g_binder_runtime.parcel_write_byte_array(
+      in, reinterpret_cast<const int8_t *>(path), static_cast<int32_t>(path_length));
+  if (status != STATUS_OK) {
+    LOGE("streamclient: write play path failed status=%d", status);
+    g_binder_runtime.parcel_delete(in);
+    return false;
+  }
+
+  AParcel *out = nullptr;
+  status = g_binder_runtime.binder_transact(g_remote, kTxnPlayFile, &in, &out, 0);
+  if (status != STATUS_OK) {
+    LOGE("streamclient: transact play failed status=%d path=%.*s", status,
+         static_cast<int>(path_length), path);
+    if (out != nullptr) g_binder_runtime.parcel_delete(out);
+    return false;
+  }
+  if (out != nullptr) g_binder_runtime.parcel_delete(out);
+  return true;
+}
+
+bool TransactStopPlaybackLocked() {
+  if (!EnsureConnectedLocked()) return false;
+
+  AParcel *in = nullptr;
+  binder_status_t status = g_binder_runtime.binder_prepare_transaction(g_remote, &in);
+  if (status != STATUS_OK || in == nullptr) {
+    LOGE("streamclient: prepareTransaction(stop) failed status=%d", status);
+    return false;
+  }
+
+  AParcel *out = nullptr;
+  status = g_binder_runtime.binder_transact(g_remote, kTxnStopPlayback, &in, &out, 0);
+  if (status != STATUS_OK) {
+    LOGE("streamclient: transact stop failed status=%d", status);
+    if (out != nullptr) g_binder_runtime.parcel_delete(out);
+    return false;
+  }
+  if (out != nullptr) g_binder_runtime.parcel_delete(out);
+  return true;
+}
+
 bool TransactClearLocked() {
   if (!EnsureConnectedLocked()) return false;
 
@@ -176,4 +229,25 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_com_namnh_awesomecam_VideoBridge_nativeClearFrame(JNIEnv *, jclass) {
   std::lock_guard<std::mutex> lock(awesomecam::g_client_mutex);
   return awesomecam::TransactClearLocked() ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_namnh_awesomecam_VideoBridge_nativePlayFile(JNIEnv *env, jclass, jstring path) {
+  if (path == nullptr) return JNI_FALSE;
+  const char *utf = env->GetStringUTFChars(path, nullptr);
+  if (utf == nullptr) return JNI_FALSE;
+  const size_t len = strlen(utf);
+  bool ok = false;
+  {
+    std::lock_guard<std::mutex> lock(awesomecam::g_client_mutex);
+    ok = awesomecam::TransactPlayFileLocked(utf, len);
+  }
+  env->ReleaseStringUTFChars(path, utf);
+  return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_namnh_awesomecam_VideoBridge_nativeStopPlayback(JNIEnv *, jclass) {
+  std::lock_guard<std::mutex> lock(awesomecam::g_client_mutex);
+  return awesomecam::TransactStopPlaybackLocked() ? JNI_TRUE : JNI_FALSE;
 }

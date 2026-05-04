@@ -11,6 +11,8 @@ static constexpr const char *kVideo2CameraDescriptor =
 enum TransactionCode : uint32_t {
   kTxnSetFrame = 1,
   kTxnClearFrame = 2,
+  kTxnPlayFile = 3,
+  kTxnStopPlayback = 4,
 };
 
 enum FrameFormat : int32_t {

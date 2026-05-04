@@ -1,7 +1,28 @@
+import java.io.ByteArrayOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
 }
+
+
+fun gitShortSha(): String {
+    return try {
+        val stdout = ByteArrayOutputStream()
+        exec {
+            commandLine("git", "rev-parse", "--short", "HEAD")
+            standardOutput = stdout
+        }
+        stdout.toString().trim().ifEmpty { "nogit" }
+    } catch (_: Exception) {
+        "nogit"
+    }
+}
+
+fun buildStamp(): String = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
 
 android {
     namespace = "com.namnh.awesomecam"
@@ -13,6 +34,9 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        buildConfigField("String", "GIT_SHA", "\"${gitShortSha()}\"")
+        buildConfigField("String", "BUILD_STAMP", "\"${buildStamp()}\"")
+        buildConfigField("String", "ARCH_LABEL", "\"native-player\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -33,6 +57,7 @@ android {
 
     buildFeatures {
         prefab = true
+        buildConfig = true
     }
 
     compileOptions {

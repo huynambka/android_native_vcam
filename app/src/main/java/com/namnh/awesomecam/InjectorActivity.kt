@@ -12,6 +12,7 @@ import kotlin.concurrent.thread
 
 class InjectorActivity : AppCompatActivity() {
     private lateinit var summaryText: TextView
+    private lateinit var buildTitleText: TextView
     private lateinit var feedController: Mp4FeedController
     private lateinit var feedButton: Button
 
@@ -31,11 +32,16 @@ class InjectorActivity : AppCompatActivity() {
         setContentView(R.layout.activity_injector)
 
         summaryText = findViewById(R.id.summaryText)
+        buildTitleText = findViewById(R.id.buildTitleText)
         feedController = Mp4FeedController(::appendStatus)
         feedButton = findViewById(R.id.feedButton)
 
+        val buildIdentity = buildIdentityLabel()
+        buildTitleText.text = buildIdentity
+        title = buildIdentity
+
         TelemetryStore.setInitialStatusIfEmpty(
-            "Idle\n\nRequired assets: $HELPER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
+            "Build: $buildIdentity\n\nRequired assets: $HELPER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
                 "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
                 "Stage 2: $RUNTIME_DIR/$HOOK_ASSET (call main_hook)\n\n" +
                 "File source: ${Mp4FeedController.DEFAULT_VIDEO_PATH}",
@@ -102,6 +108,10 @@ class InjectorActivity : AppCompatActivity() {
     override fun onDestroy() {
         feedController.stop()
         super.onDestroy()
+    }
+
+    private fun buildIdentityLabel(): String {
+        return "awesomeCAM ${BuildConfig.VERSION_NAME} · ${BuildConfig.ARCH_LABEL} · ${BuildConfig.GIT_SHA} · ${BuildConfig.BUILD_STAMP}"
     }
 
     private fun runAsync(block: () -> Unit) {

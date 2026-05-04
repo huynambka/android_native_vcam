@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 
+#include "libyuv_runtime.h"
 #include "shadowhook.h"
 #include "video2camera_service.h"
 #include "video2camera_ipc.h"
@@ -161,6 +162,25 @@ struct SourceState {
   uint64_t load_generation = 0;
 };
 
+enum class ScaledFrameSourceKind {
+  kNone = 0,
+  kBinder = 1,
+  kLocal = 2,
+};
+
+struct ScaledFrameCacheEntry {
+  int dst_width = 0;
+  int dst_height = 0;
+  SourceDescriptor source_descriptor;
+  std::vector<uint8_t> scaled_i420;
+};
+
+struct ScaledFrameCacheState {
+  ScaledFrameSourceKind source_kind = ScaledFrameSourceKind::kNone;
+  uint64_t source_generation = 0;
+  std::vector<ScaledFrameCacheEntry> entries;
+};
+
 struct I420View {
   const uint8_t *y = nullptr;
   const uint8_t *u = nullptr;
@@ -210,6 +230,7 @@ std::mutex g_stream_records_mutex;
 std::vector<StreamRecord> g_stream_records;
 std::mutex g_frame_process_mutex;
 SourceState g_source_state;
+ScaledFrameCacheState g_scaled_frame_cache;
 GraphicBufferApi g_graphic_buffer_api;
 void *g_self_handle = nullptr;
 
@@ -958,6 +979,24 @@ bool build_scaled_i420_locked(const SourceDescriptor &descriptor,
   compute_center_crop(src.width, src.height, dst_width, dst_height, &crop_x, &crop_y,
                       &crop_w, &crop_h);
 
+  const uint8_t *src_y = src.y + static_cast<size_t>(crop_y) * src.y_stride + crop_x;
+  const uint8_t *src_u =
+      src.u + static_cast<size_t>(crop_y / 2) * src.u_stride + (crop_x / 2);
+  const uint8_t *src_v =
+      src.v + static_cast<size_t>(crop_y / 2) * src.v_stride + (crop_x / 2);
+  constexpr int kLibYuvFilterBilinear = 2;
+  if (awesomecam::LibYuvI420Scale(src_y, src.y_stride,
+                                  src_u, src.u_stride,
+                                  src_v, src.v_stride,
+                                  crop_w, crop_h,
+                                  dst_y, dst_width,
+                                  dst_u, static_cast<int>(dst_chroma_width),
+                                  dst_v, static_cast<int>(dst_chroma_width),
+                                  dst_width, dst_height,
+                                  kLibYuvFilterBilinear)) {
+    return true;
+  }
+
   scale_plane_crop_nn(src.y, src.y_stride, crop_x, crop_y, crop_w, crop_h, dst_y,
                       dst_width, dst_width, dst_height);
   scale_plane_crop_nn(src.u, src.u_stride, crop_x / 2, crop_y / 2, crop_w / 2,
@@ -968,6 +1007,130 @@ bool build_scaled_i420_locked(const SourceDescriptor &descriptor,
                       crop_h / 2, dst_v, static_cast<int>(dst_chroma_width),
                       static_cast<int>(dst_chroma_width),
                       static_cast<int>(dst_chroma_height));
+  return true;
+}
+
+const ScaledFrameCacheEntry *find_scaled_frame_cache_entry_locked(
+    ScaledFrameSourceKind source_kind, uint64_t source_generation, int dst_width,
+    int dst_height) {
+  if (g_scaled_frame_cache.source_kind != source_kind ||
+      g_scaled_frame_cache.source_generation != source_generation) {
+    return nullptr;
+  }
+  for (const auto &entry : g_scaled_frame_cache.entries) {
+    if (entry.dst_width == dst_width && entry.dst_height == dst_height) {
+      return &entry;
+    }
+  }
+  return nullptr;
+}
+
+void reset_scaled_frame_cache_locked(ScaledFrameSourceKind source_kind,
+                                     uint64_t source_generation) {
+  if (g_scaled_frame_cache.source_kind == source_kind &&
+      g_scaled_frame_cache.source_generation == source_generation) {
+    return;
+  }
+  g_scaled_frame_cache.source_kind = source_kind;
+  g_scaled_frame_cache.source_generation = source_generation;
+  g_scaled_frame_cache.entries.clear();
+}
+
+const ScaledFrameCacheEntry *store_scaled_frame_cache_entry_locked(
+    ScaledFrameSourceKind source_kind, uint64_t source_generation, int dst_width,
+    int dst_height, const SourceDescriptor &source_descriptor,
+    std::vector<uint8_t> &&scaled_i420) {
+  reset_scaled_frame_cache_locked(source_kind, source_generation);
+  for (auto &entry : g_scaled_frame_cache.entries) {
+    if (entry.dst_width == dst_width && entry.dst_height == dst_height) {
+      entry.source_descriptor = source_descriptor;
+      entry.scaled_i420 = std::move(scaled_i420);
+      return &entry;
+    }
+  }
+  g_scaled_frame_cache.entries.push_back(
+      ScaledFrameCacheEntry{dst_width, dst_height, source_descriptor,
+                            std::move(scaled_i420)});
+  return &g_scaled_frame_cache.entries.back();
+}
+
+bool load_latest_scaled_i420_for_dst(int dst_width, int dst_height,
+                                     SourceDescriptor *source_descriptor,
+                                     const std::vector<uint8_t> **scaled_i420) {
+  if (source_descriptor == nullptr || scaled_i420 == nullptr || dst_width <= 0 ||
+      dst_height <= 0) {
+    return false;
+  }
+
+  *source_descriptor = SourceDescriptor{};
+  *scaled_i420 = nullptr;
+
+  awesomecam::BinderFrameState binder_state;
+  if (awesomecam::PeekLatestBinderFrameState(&binder_state) &&
+      binder_state.format == awesomecam::kFrameFormatI420) {
+    if (const auto *cached = find_scaled_frame_cache_entry_locked(
+            ScaledFrameSourceKind::kBinder, binder_state.generation, dst_width,
+            dst_height)) {
+      *source_descriptor = cached->source_descriptor;
+      *scaled_i420 = &cached->scaled_i420;
+      return true;
+    }
+
+    awesomecam::BinderFrameCopy binder_frame;
+    if (awesomecam::CopyLatestBinderFrame(&binder_frame) &&
+        binder_frame.format == awesomecam::kFrameFormatI420) {
+      SourceDescriptor binder_descriptor;
+      binder_descriptor.valid = true;
+      binder_descriptor.sequence = false;
+      binder_descriptor.path = "binder://Video2CameraService";
+      binder_descriptor.width = binder_frame.width;
+      binder_descriptor.height = binder_frame.height;
+      binder_descriptor.fps = kDefaultSourceFps;
+      binder_descriptor.format = SourcePixelFormat::kI420;
+
+      std::vector<uint8_t> built_i420;
+      if (!build_scaled_i420_locked(binder_descriptor, binder_frame.bytes, dst_width,
+                                    dst_height, &built_i420)) {
+        LOGE("Failed to scale binder frame gen=%llu %dx%d for %dx%d",
+             static_cast<unsigned long long>(binder_frame.generation),
+             binder_frame.width, binder_frame.height, dst_width, dst_height);
+      } else {
+        const auto *cached = store_scaled_frame_cache_entry_locked(
+            ScaledFrameSourceKind::kBinder, binder_frame.generation, dst_width,
+            dst_height, binder_descriptor, std::move(built_i420));
+        *source_descriptor = cached->source_descriptor;
+        *scaled_i420 = &cached->scaled_i420;
+        return true;
+      }
+    }
+  }
+
+  std::lock_guard<std::mutex> source_lock(g_source_state.mutex);
+  if (!ensure_source_frame_locked(dst_width, dst_height, source_descriptor)) {
+    return false;
+  }
+
+  if (const auto *cached = find_scaled_frame_cache_entry_locked(
+          ScaledFrameSourceKind::kLocal, g_source_state.load_generation, dst_width,
+          dst_height)) {
+    *source_descriptor = cached->source_descriptor;
+    *scaled_i420 = &cached->scaled_i420;
+    return true;
+  }
+
+  std::vector<uint8_t> built_i420;
+  if (!build_scaled_i420_locked(*source_descriptor, g_source_state.frame_bytes, dst_width,
+                                dst_height, &built_i420)) {
+    LOGE("Failed to build scaled I420 for %dx%d from %s", dst_width, dst_height,
+         source_pixel_format_name(source_descriptor->format));
+    return false;
+  }
+
+  const auto *cached = store_scaled_frame_cache_entry_locked(
+      ScaledFrameSourceKind::kLocal, g_source_state.load_generation, dst_width,
+      dst_height, *source_descriptor, std::move(built_i420));
+  *source_descriptor = cached->source_descriptor;
+  *scaled_i420 = &cached->scaled_i420;
   return true;
 }
 
@@ -1051,48 +1214,12 @@ bool try_replace_camera3_frame(
   if (!resolve_graphic_buffer_api()) return false;
 
   SourceDescriptor source_descriptor;
-  std::vector<uint8_t> scaled_i420;
-  bool have_source = false;
-
-  {
-    awesomecam::BinderFrameCopy binder_frame;
-    if (awesomecam::CopyLatestBinderFrame(&binder_frame) &&
-        binder_frame.format == awesomecam::kFrameFormatI420) {
-      source_descriptor.valid = true;
-      source_descriptor.sequence = false;
-      source_descriptor.path = "binder://Video2CameraService";
-      source_descriptor.width = binder_frame.width;
-      source_descriptor.height = binder_frame.height;
-      source_descriptor.fps = kDefaultSourceFps;
-      source_descriptor.format = SourcePixelFormat::kI420;
-      have_source = build_scaled_i420_locked(source_descriptor, binder_frame.bytes,
-                                             static_cast<int>(buffer.stream->width),
-                                             static_cast<int>(buffer.stream->height),
-                                             &scaled_i420);
-      if (!have_source) {
-        LOGE("Failed to scale binder frame gen=%llu %dx%d",
-             static_cast<unsigned long long>(binder_frame.generation), binder_frame.width,
-             binder_frame.height);
-      }
-    }
-  }
-
-  if (!have_source) {
-    std::lock_guard<std::mutex> source_lock(g_source_state.mutex);
-    if (!ensure_source_frame_locked(static_cast<int>(buffer.stream->width),
-                                    static_cast<int>(buffer.stream->height),
-                                    &source_descriptor)) {
-      return false;
-    }
-    if (!build_scaled_i420_locked(source_descriptor, g_source_state.frame_bytes,
-                                  static_cast<int>(buffer.stream->width),
-                                  static_cast<int>(buffer.stream->height),
-                                  &scaled_i420)) {
-      LOGE("Failed to build scaled I420 for %ux%u from %s", buffer.stream->width,
-           buffer.stream->height,
-           source_pixel_format_name(source_descriptor.format));
-      return false;
-    }
+  const std::vector<uint8_t> *scaled_i420 = nullptr;
+  if (!load_latest_scaled_i420_for_dst(static_cast<int>(buffer.stream->width),
+                                       static_cast<int>(buffer.stream->height),
+                                       &source_descriptor, &scaled_i420) ||
+      scaled_i420 == nullptr) {
+    return false;
   }
 
   void *anw_buffer = reinterpret_cast<void *>(
@@ -1115,7 +1242,8 @@ bool try_replace_camera3_frame(
     LOGE("GraphicBuffer::lockYCbCr failed rc=%d for %ux%u surfaceId=%d", lock_rc,
          buffer.stream->width, buffer.stream->height, surface_id);
   } else {
-    replaced = write_i420_to_ycbcr(scaled_i420, static_cast<int>(buffer.stream->width),
+    replaced = write_i420_to_ycbcr(*scaled_i420,
+                                   static_cast<int>(buffer.stream->width),
                                    static_cast<int>(buffer.stream->height), layout);
     const int unlock_rc = g_graphic_buffer_api.unlock(graphic_buffer);
     if (unlock_rc != 0) {
