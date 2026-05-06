@@ -33,6 +33,7 @@ object TelemetryStore {
 
     private var statusText: String = ""
     private var logText: String = LOGCAT_PLACEHOLDER
+    private var lastPromotedExecutionLine: String = ""
 
     fun setInitialStatusIfEmpty(value: String) {
         var changed = false
@@ -61,6 +62,7 @@ object TelemetryStore {
     }
 
     fun appendLogLine(line: String) {
+        val promoted = promoteImportantLogToExecutionStatus(line)
         synchronized(lock) {
             logText = trimOutput(
                 if (logText.isBlank() || logText == LOGCAT_PLACEHOLDER) {
@@ -69,6 +71,10 @@ object TelemetryStore {
                     "$logText\n$line"
                 },
             )
+            if (promoted != null && promoted != lastPromotedExecutionLine) {
+                statusText = appendStatusLocked(promoted)
+                lastPromotedExecutionLine = promoted
+            }
         }
         dispatch()
     }
@@ -154,6 +160,89 @@ object TelemetryStore {
         logcatThread?.interrupt()
         logcatThread = null
         process?.destroy()
+    }
+
+    private fun appendStatusLocked(message: String): String {
+        return trimOutput(
+            buildString {
+                if (statusText.isNotBlank()) {
+                    append(statusText)
+                    append("\n\n")
+                }
+                append(message)
+            },
+        )
+    }
+
+    private fun promoteImportantLogToExecutionStatus(line: String): String? {
+        val cameraTargetActive = Regex("""Video2CameraService target active gen=\d+ (\d+x\d+) fmt=(0x[0-9a-fA-F]+)""")
+            .find(line)
+        if (cameraTargetActive != null) {
+            val (resolution, format) = cameraTargetActive.destructured
+            return "Camera target detected: $resolution fmt=$format"
+        }
+
+        val media = line.substringAfter("MediaCodecPlayer: ", missingDelimiterValue = "")
+            .takeIf { it.isNotBlank() }
+            ?: return null
+
+        Regex("""initial input=(\S+) autoVariant=(\d+) fpsCap=(\d+) default=(\S+)""")
+            .find(media)
+            ?.let {
+                val (input, autoVariant, fpsCap, defaultInput) = it.destructured
+                return "Playback initial input: ${input.substringAfterLast('/')} autoVariant=$autoVariant fpsCap=$fpsCap default=${defaultInput.substringAfterLast('/')}"
+            }
+
+        Regex("""stream=\d+ mime=\S+ src=(\d+x\d+) out=(\d+x\d+).*fpsCap=(\d+).*input=(\S+)""")
+            .find(media)
+            ?.let {
+                val (src, out, fpsCap, input) = it.destructured
+                return "Playback decoder active: src=$src out=$out fpsCap=$fpsCap input=${input.substringAfterLast('/')}"
+            }
+
+        Regex("""selected override variant (\S+) path=(\S+) reason=(\S+)""")
+            .find(media)
+            ?.let {
+                val (variant, path, reason) = it.destructured
+                return "Playback resolution selected: $variant override reason=$reason input=${path.substringAfterLast('/')}"
+            }
+
+        Regex("""selected target variant (\S+) path=(\S+) hits=(\d+) reason=(\S+)""")
+            .find(media)
+            ?.let {
+                val (variant, path, hits, reason) = it.destructured
+                return "Playback resolution selected: $variant exact target hits=$hits reason=$reason input=${path.substringAfterLast('/')}"
+            }
+
+        Regex("""selected nearest target variant (\S+) path=(\S+) for target=(\d+x\d+) hits=(\d+) score=([0-9.]+) reason=(\S+)""")
+            .find(media)
+            ?.let {
+                val (variant, path, target, hits, score, reason) = it.destructured
+                return "Playback resolution selected: $variant nearest for target=$target hits=$hits score=$score reason=$reason input=${path.substringAfterLast('/')}"
+            }
+
+        Regex("""target (\d+x\d+) has no exact mp4 variant""")
+            .find(media)
+            ?.let {
+                val (target) = it.destructured
+                return "Playback target $target has no exact MP4 variant; selecting nearest pre-scaled input and ReadyFrameCache will scale final output"
+            }
+
+        Regex("""switching input current=(\S+) next=(\S+)""")
+            .find(media)
+            ?.let {
+                val (current, next) = it.destructured
+                return "Playback input switch: ${current.substringAfterLast('/')} -> ${next.substringAfterLast('/')}"
+            }
+
+        Regex("""restarting for target variant input=(\S+)""")
+            .find(media)
+            ?.let {
+                val (input) = it.destructured
+                return "Playback restarted with selected input: ${input.substringAfterLast('/')}"
+            }
+
+        return null
     }
 
     private fun trimOutput(text: String): String {
