@@ -4,10 +4,14 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -38,6 +42,7 @@ struct ReadySlot {
 };
 
 std::mutex g_ready_mutex;
+std::condition_variable g_ready_cv;
 std::vector<TargetKey> g_targets;
 std::vector<ReadySlot> g_slots;
 uint64_t g_last_source_generation = 0;
@@ -276,17 +281,16 @@ bool cache_has_fresh_frame_locked(const TargetKey &target, uint64_t generation) 
   return false;
 }
 
-void BuildAndStoreLatestSource() {
+bool BuildAndStoreLatestSource(std::vector<uint8_t> *source_copy) {
   SharedMemoryFrameView source{};
   if (!CopyLatestSourceFrame(&source) || source.bytes == nullptr || source.size == 0) {
-    usleep(10000);
-    return;
+    return false;
   }
 
   std::vector<TargetKey> targets;
   {
     std::lock_guard<std::mutex> lock(g_ready_mutex);
-    if (g_targets.empty()) return;
+    if (g_targets.empty()) return false;
     bool needs_build = source.generation != g_last_source_generation;
     if (!needs_build) {
       for (const auto &target : g_targets) {
@@ -296,12 +300,13 @@ void BuildAndStoreLatestSource() {
         }
       }
     }
-    if (!needs_build) return;
+    if (!needs_build) return false;
     targets = g_targets;
   }
 
   const uint64_t perf_start_ns = now_ns();
-  std::vector<uint8_t> source_copy(source.bytes, source.bytes + source.size);
+  if (source_copy == nullptr) return false;
+  source_copy->assign(source.bytes, source.bytes + source.size);
   std::vector<std::shared_ptr<const ReadyI420Frame>> built_frames;
   built_frames.reserve(targets.size());
   for (const auto &target : targets) {
@@ -311,8 +316,8 @@ void BuildAndStoreLatestSource() {
     frame->layout = target.layout;
     frame->generation = source.generation;
     frame->pts_us = source.pts_us;
-    if (!build_ready_frame_for_layout(source.width, source.height, source_copy.data(),
-                                      source_copy.size(), target.width, target.height,
+    if (!build_ready_frame_for_layout(source.width, source.height, source_copy->data(),
+                                      source_copy->size(), target.width, target.height,
                                       target.layout, &frame->bytes, &frame->y_stride,
                                       &frame->c_stride)) {
       continue;
@@ -331,13 +336,17 @@ void BuildAndStoreLatestSource() {
          static_cast<unsigned long long>(source.generation), source.width, source.height,
          targets.size(), built_frames.size(), ns_to_ms(now_ns() - perf_start_ns));
   }
+  return !built_frames.empty();
 }
 
 void *ReadyWorkerMain(void *) {
   LOGI("ReadyFrameCache worker start");
+  (void)setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), -4);
+  std::vector<uint8_t> source_copy;
   for (;;) {
-    BuildAndStoreLatestSource();
-    usleep(5000);
+    const bool built = BuildAndStoreLatestSource(&source_copy);
+    std::unique_lock<std::mutex> lock(g_ready_mutex);
+    g_ready_cv.wait_for(lock, std::chrono::milliseconds(built ? 1 : 5));
   }
   return nullptr;
 }
@@ -367,18 +376,21 @@ void RegisterReadyFrameOutputLayout(int32_t width, int32_t height,
   if (width <= 0 || height <= 0) return;
   if (!IsSupportedReadyLayout(layout)) return;
   EnsureWorkerStarted();
-  std::lock_guard<std::mutex> lock(g_ready_mutex);
-  for (const auto &target : g_targets) {
-    if (same_key(target, width, height, layout)) return;
+  {
+    std::lock_guard<std::mutex> lock(g_ready_mutex);
+    for (const auto &target : g_targets) {
+      if (same_key(target, width, height, layout)) return;
+    }
+    if (g_targets.size() >= kMaxReadyTargets) {
+      LOGW("ReadyFrameCache target full; ignore %dx%d layout=%s",
+           width, height, LayoutName(layout));
+      return;
+    }
+    g_targets.push_back(TargetKey{width, height, layout});
+    LOGI("ReadyFrameCache registered target %dx%d layout=%s count=%zu", width, height,
+         LayoutName(layout), g_targets.size());
   }
-  if (g_targets.size() >= kMaxReadyTargets) {
-    LOGW("ReadyFrameCache target full; ignore %dx%d layout=%s",
-         width, height, LayoutName(layout));
-    return;
-  }
-  g_targets.push_back(TargetKey{width, height, layout});
-  LOGI("ReadyFrameCache registered target %dx%d layout=%s count=%zu", width, height,
-       LayoutName(layout), g_targets.size());
+  g_ready_cv.notify_one();
 }
 
 std::shared_ptr<const ReadyI420Frame> GetReadyI420Frame(int32_t width,
@@ -398,10 +410,13 @@ std::shared_ptr<const ReadyI420Frame> GetReadyFrameForLayout(
 }
 
 void ClearReadyFrameCache() {
-  std::lock_guard<std::mutex> lock(g_ready_mutex);
-  g_slots.clear();
-  g_targets.clear();
-  g_last_source_generation = 0;
+  {
+    std::lock_guard<std::mutex> lock(g_ready_mutex);
+    g_slots.clear();
+    g_targets.clear();
+    g_last_source_generation = 0;
+  }
+  g_ready_cv.notify_one();
 }
 
 }  // namespace awesomecam
