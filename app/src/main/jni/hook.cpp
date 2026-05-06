@@ -12,6 +12,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -125,6 +126,7 @@ constexpr uint64_t kNsPerSecond = 1000000000ULL;
 constexpr int kDefaultFenceWaitTimeoutMs = 1000;
 constexpr int kSurfaceFenceWaitTimeoutMs = 3;  // Surface hot path: skip, do not stall, after a short wait.
 constexpr uint64_t kWriteModeRefreshIntervalNs = kNsPerSecond;
+constexpr size_t kMaxBufferLockCacheEntries = 128;
 constexpr const char *kWriteAllFlagPath = "/data/camera/awesomecam_write_all";
 constexpr const char *kWriteCamera3FlagPath = "/data/camera/awesomecam_write_camera3";
 
@@ -132,6 +134,13 @@ enum class WriteMode : int {
   kSurfaceOnly = 0,
   kAll = 1,
   kCamera3Only = 2,
+};
+
+enum class BufferLockPath : int {
+  kUnknown = 0,
+  kYCbCr = 1,
+  kAhbPlanes = 2,
+  kRaw = 3,
 };
 
 struct StreamRecord {
@@ -149,6 +158,26 @@ struct StreamRecord {
   int32_t color_space;
   bool use_readout_timestamp;
   uint64_t return_buffer_log_count;
+};
+
+struct BufferLockCacheEntry {
+  uintptr_t anw_buffer = 0;
+  int width = 0;
+  int height = 0;
+  int format = 0;
+  BufferLockPath preferred = BufferLockPath::kUnknown;
+  bool ycbcr_failed = false;
+  bool ahb_failed = false;
+  bool raw_failed = false;
+  uint64_t updates = 0;
+};
+
+struct CachedWriteResult {
+  BufferLockPath path = BufferLockPath::kUnknown;
+  android_ycbcr layout{};
+  int raw_bpp = 0;
+  int raw_stride = 0;
+  bool raw_nv21 = false;
 };
 
 struct GraphicBufferSpRet {
@@ -228,7 +257,9 @@ void *g_surface_hook_queue_buffer_stub = nullptr;
 void *g_surface_set_usage_stub = nullptr;
 
 std::mutex g_stream_records_mutex;
+std::mutex g_buffer_lock_cache_mutex;
 std::vector<StreamRecord> g_stream_records;
+std::vector<BufferLockCacheEntry> g_buffer_lock_cache;
 GraphicBufferApi g_graphic_buffer_api;
 void *g_self_handle = nullptr;
 
@@ -303,6 +334,128 @@ bool write_mode_allows_surface(WriteMode mode) {
 
 bool write_mode_allows_camera3(WriteMode mode) {
   return mode == WriteMode::kAll || mode == WriteMode::kCamera3Only;
+}
+
+const char *buffer_lock_path_name(BufferLockPath path) {
+  switch (path) {
+    case BufferLockPath::kYCbCr:
+      return "lockYCbCr";
+    case BufferLockPath::kAhbPlanes:
+      return "AHardwareBuffer_lockPlanes";
+    case BufferLockPath::kRaw:
+      return "GraphicBuffer::lock";
+    case BufferLockPath::kUnknown:
+    default:
+      return "unknown";
+  }
+}
+
+bool same_buffer_lock_key(const BufferLockCacheEntry &entry, uintptr_t anw_buffer,
+                          int width, int height, int format) {
+  return entry.anw_buffer == anw_buffer && entry.width == width &&
+         entry.height == height && entry.format == format;
+}
+
+BufferLockCacheEntry lookup_buffer_lock_cache(uintptr_t anw_buffer, int width,
+                                              int height, int format) {
+  if (anw_buffer == 0 || width <= 0 || height <= 0) return BufferLockCacheEntry{};
+  std::lock_guard<std::mutex> lock(g_buffer_lock_cache_mutex);
+  for (const auto &entry : g_buffer_lock_cache) {
+    if (same_buffer_lock_key(entry, anw_buffer, width, height, format)) {
+      return entry;
+    }
+  }
+  return BufferLockCacheEntry{};
+}
+
+bool buffer_lock_path_failed(const BufferLockCacheEntry &entry, BufferLockPath path) {
+  switch (path) {
+    case BufferLockPath::kYCbCr:
+      return entry.ycbcr_failed;
+    case BufferLockPath::kAhbPlanes:
+      return entry.ahb_failed;
+    case BufferLockPath::kRaw:
+      return entry.raw_failed;
+    case BufferLockPath::kUnknown:
+    default:
+      return false;
+  }
+}
+
+void set_buffer_lock_path_failed(BufferLockCacheEntry *entry, BufferLockPath path,
+                                 bool failed) {
+  if (entry == nullptr) return;
+  switch (path) {
+    case BufferLockPath::kYCbCr:
+      entry->ycbcr_failed = failed;
+      break;
+    case BufferLockPath::kAhbPlanes:
+      entry->ahb_failed = failed;
+      break;
+    case BufferLockPath::kRaw:
+      entry->raw_failed = failed;
+      break;
+    case BufferLockPath::kUnknown:
+    default:
+      break;
+  }
+}
+
+void record_buffer_lock_path(uintptr_t anw_buffer, int width, int height, int format,
+                             BufferLockPath path, bool success, const char *where) {
+  if (anw_buffer == 0 || width <= 0 || height <= 0 || path == BufferLockPath::kUnknown) {
+    return;
+  }
+
+  BufferLockCacheEntry snapshot{};
+  bool added = false;
+  {
+    std::lock_guard<std::mutex> lock(g_buffer_lock_cache_mutex);
+    auto it = std::find_if(g_buffer_lock_cache.begin(), g_buffer_lock_cache.end(),
+                           [&](const BufferLockCacheEntry &entry) {
+                             return same_buffer_lock_key(entry, anw_buffer, width,
+                                                         height, format);
+                           });
+    if (it == g_buffer_lock_cache.end()) {
+      if (g_buffer_lock_cache.size() >= kMaxBufferLockCacheEntries) {
+        g_buffer_lock_cache.erase(g_buffer_lock_cache.begin());
+      }
+      BufferLockCacheEntry entry{};
+      entry.anw_buffer = anw_buffer;
+      entry.width = width;
+      entry.height = height;
+      entry.format = format;
+      g_buffer_lock_cache.push_back(entry);
+      it = g_buffer_lock_cache.end() - 1;
+      added = true;
+    }
+
+    it->updates += 1;
+    if (success) {
+      it->preferred = path;
+      set_buffer_lock_path_failed(&*it, path, false);
+    } else {
+      set_buffer_lock_path_failed(&*it, path, true);
+      if (it->preferred == path) it->preferred = BufferLockPath::kUnknown;
+    }
+    snapshot = *it;
+  }
+
+  if (success && (added || snapshot.updates <= 3 || (snapshot.updates % 120) == 0)) {
+    LOGI("%s buffer lock cache %dx%d fmt=%#x anw=%p preferred=%s failed[y=%d ahb=%d raw=%d]",
+         where != nullptr ? where : "replace", width, height, format,
+         reinterpret_cast<void *>(anw_buffer), buffer_lock_path_name(snapshot.preferred),
+         snapshot.ycbcr_failed ? 1 : 0, snapshot.ahb_failed ? 1 : 0,
+         snapshot.raw_failed ? 1 : 0);
+  }
+}
+
+void append_unique_lock_path(std::vector<BufferLockPath> *order, BufferLockPath path) {
+  if (order == nullptr || path == BufferLockPath::kUnknown) return;
+  for (BufferLockPath existing : *order) {
+    if (existing == path) return;
+  }
+  order->push_back(path);
 }
 
 bool resolve_graphic_buffer_api() {
@@ -764,6 +917,142 @@ bool try_write_i420_to_ahardwarebuffer_planes(void *graphic_buffer,
   return replaced;
 }
 
+bool try_write_i420_to_ycbcr_lock(void *graphic_buffer, const uint8_t *frame_bytes,
+                                  size_t frame_size, int width, int height,
+                                  const char *where, CachedWriteResult *stats) {
+  if (graphic_buffer == nullptr || frame_bytes == nullptr) return false;
+  android_ycbcr layout{};
+  const int lock_rc = g_graphic_buffer_api.lock_ycbcr(graphic_buffer,
+                                                      kGraphicBufferCpuLockUsage,
+                                                      &layout);
+  if (lock_rc != 0) {
+    const uint64_t fail_count =
+        g_lock_ycbcr_fail_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (fail_count <= 20 || (fail_count % 120) == 0) {
+      LOGE("%s GraphicBuffer::lockYCbCr failed #%llu rc=%d for %dx%d",
+           where != nullptr ? where : "replace",
+           static_cast<unsigned long long>(fail_count), lock_rc, width, height);
+    }
+    return false;
+  }
+
+  const bool replaced = write_i420_to_ycbcr(frame_bytes, frame_size, width, height, layout);
+  const int unlock_rc = g_graphic_buffer_api.unlock(graphic_buffer);
+  if (unlock_rc != 0) {
+    LOGW("%s GraphicBuffer::unlock failed rc=%d",
+         where != nullptr ? where : "replace", unlock_rc);
+  }
+  if (replaced && stats != nullptr) {
+    stats->path = BufferLockPath::kYCbCr;
+    stats->layout = layout;
+  }
+  return replaced;
+}
+
+bool try_write_i420_to_raw_lock(void *graphic_buffer, const uint8_t *frame_bytes,
+                                size_t frame_size, int width, int height,
+                                const char *where, CachedWriteResult *stats) {
+  if (graphic_buffer == nullptr || frame_bytes == nullptr) return false;
+  void *raw_vaddr = nullptr;
+  int raw_bpp = 0;
+  int raw_stride = 0;
+  const uint64_t raw_lock_start_ns = monotonic_time_ns();
+  const int raw_rc = g_graphic_buffer_api.lock(graphic_buffer,
+                                               kGraphicBufferCpuLockUsage,
+                                               &raw_vaddr, &raw_bpp, &raw_stride);
+  const uint64_t raw_lock_done_ns = monotonic_time_ns();
+  if (raw_rc != 0 || raw_vaddr == nullptr) {
+    const uint64_t raw_fail =
+        g_raw_lock_fail_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (raw_fail <= 20 || (raw_fail % 120) == 0) {
+      LOGE("%s GraphicBuffer::raw lock failed #%llu rc=%d %dx%d bpp=%d stride=%d vaddr=%p",
+           where != nullptr ? where : "replace",
+           static_cast<unsigned long long>(raw_fail), raw_rc, width, height,
+           raw_bpp, raw_stride, raw_vaddr);
+    }
+    return false;
+  }
+
+  const bool nv21 = prefer_raw_nv21_output();
+  const bool replaced = write_i420_to_contiguous_nv(frame_bytes, frame_size, width, height,
+                                                   raw_vaddr, raw_stride, nv21);
+  const int unlock_rc = g_graphic_buffer_api.unlock(graphic_buffer);
+  if (unlock_rc != 0) {
+    LOGW("%s GraphicBuffer::raw unlock failed rc=%d",
+         where != nullptr ? where : "replace", unlock_rc);
+  }
+  const uint64_t raw_success =
+      g_raw_lock_success_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (raw_success <= 20 || (raw_success % 120) == 0 || replaced) {
+    LOGI("%s GraphicBuffer::raw lock #%llu %dx%d bpp=%d stride=%d nv21=%d replaced=%d lock=%.3fms",
+         where != nullptr ? where : "replace",
+         static_cast<unsigned long long>(raw_success), width, height, raw_bpp,
+         raw_stride, nv21 ? 1 : 0, replaced ? 1 : 0,
+         ns_to_ms(raw_lock_done_ns - raw_lock_start_ns));
+  }
+  if (replaced && stats != nullptr) {
+    stats->path = BufferLockPath::kRaw;
+    stats->raw_bpp = raw_bpp;
+    stats->raw_stride = raw_stride;
+    stats->raw_nv21 = nv21;
+  }
+  return replaced;
+}
+
+bool try_write_i420_to_graphic_buffer_cached(void *graphic_buffer, uintptr_t anw_buffer,
+                                             int width, int height, int format,
+                                             const uint8_t *frame_bytes,
+                                             size_t frame_size, const char *where,
+                                             CachedWriteResult *stats) {
+  if (graphic_buffer == nullptr || frame_bytes == nullptr || width <= 0 || height <= 0) {
+    return false;
+  }
+
+  BufferLockCacheEntry state =
+      lookup_buffer_lock_cache(anw_buffer, width, height, format);
+  std::vector<BufferLockPath> order;
+  append_unique_lock_path(&order, state.preferred);
+  append_unique_lock_path(&order, BufferLockPath::kYCbCr);
+  append_unique_lock_path(&order, BufferLockPath::kAhbPlanes);
+  append_unique_lock_path(&order, BufferLockPath::kRaw);
+
+  for (BufferLockPath path : order) {
+    if (path != state.preferred && buffer_lock_path_failed(state, path)) {
+      continue;
+    }
+
+    bool replaced = false;
+    CachedWriteResult local_stats{};
+    switch (path) {
+      case BufferLockPath::kYCbCr:
+        replaced = try_write_i420_to_ycbcr_lock(graphic_buffer, frame_bytes, frame_size,
+                                                width, height, where, &local_stats);
+        break;
+      case BufferLockPath::kAhbPlanes:
+        replaced = try_write_i420_to_ahardwarebuffer_planes(
+            graphic_buffer, frame_bytes, frame_size, width, height, where);
+        if (replaced) local_stats.path = BufferLockPath::kAhbPlanes;
+        break;
+      case BufferLockPath::kRaw:
+        replaced = try_write_i420_to_raw_lock(graphic_buffer, frame_bytes, frame_size,
+                                              width, height, where, &local_stats);
+        break;
+      case BufferLockPath::kUnknown:
+      default:
+        break;
+    }
+
+    record_buffer_lock_path(anw_buffer, width, height, format, path, replaced, where);
+    if (replaced) {
+      if (stats != nullptr) *stats = local_stats;
+      return true;
+    }
+    state = lookup_buffer_lock_cache(anw_buffer, width, height, format);
+  }
+
+  return false;
+}
+
 
 bool try_replace_camera3_frame(
     const android::camera3::camera_stream_buffer &buffer, int32_t surface_id,
@@ -800,89 +1089,12 @@ bool try_replace_camera3_frame(
   }
 
   const void *dec_strong_cookie = &graphic_buffer_ref;
-  bool replaced = false;
-  android_ycbcr layout{};
-  const uint64_t lock_start_ns = monotonic_time_ns();
-  const int lock_rc = g_graphic_buffer_api.lock_ycbcr(graphic_buffer,
-                                                      kGraphicBufferCpuLockUsage,
-                                                      &layout);
-  uint64_t lock_done_ns = monotonic_time_ns();
-  uint64_t write_start_ns = lock_done_ns;
-  uint64_t write_done_ns = lock_done_ns;
-  uint64_t unlock_start_ns = lock_done_ns;
-  uint64_t unlock_done_ns = lock_done_ns;
-  if (lock_rc != 0) {
-    const uint64_t fail_count =
-        g_lock_ycbcr_fail_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (fail_count <= 20 || (fail_count % 120) == 0) {
-      LOGE("GraphicBuffer::lockYCbCr failed #%llu rc=%d streamId=%d for %ux%u fmt=%#x surfaceId=%d",
-           static_cast<unsigned long long>(fail_count), lock_rc,
-           matched_stream != nullptr ? matched_stream->stream_id : -1,
-           buffer.stream->width, buffer.stream->height, buffer.stream->format,
-           surface_id);
-    }
-
-    write_start_ns = monotonic_time_ns();
-    replaced = try_write_i420_to_ahardwarebuffer_planes(
-        graphic_buffer, frame_bytes, frame_size, width, height,
-        "returnBufferCheckedLocked");
-    write_done_ns = monotonic_time_ns();
-
-    if (!replaced) {
-      void *raw_vaddr = nullptr;
-      int raw_bpp = 0;
-      int raw_stride = 0;
-      const uint64_t raw_lock_start_ns = monotonic_time_ns();
-      const int raw_rc = g_graphic_buffer_api.lock(graphic_buffer,
-                                                   kGraphicBufferCpuLockUsage,
-                                                   &raw_vaddr, &raw_bpp, &raw_stride);
-      const uint64_t raw_lock_done_ns = monotonic_time_ns();
-      lock_done_ns = raw_lock_done_ns;
-      if (raw_rc == 0 && raw_vaddr != nullptr) {
-        const uint64_t raw_success =
-            g_raw_lock_success_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        const bool nv21 = prefer_raw_nv21_output();
-        write_start_ns = monotonic_time_ns();
-        replaced = write_i420_to_contiguous_nv(frame_bytes, frame_size, width, height,
-                                               raw_vaddr, raw_stride, nv21);
-        write_done_ns = monotonic_time_ns();
-        unlock_start_ns = write_done_ns;
-        const int unlock_rc = g_graphic_buffer_api.unlock(graphic_buffer);
-        unlock_done_ns = monotonic_time_ns();
-        if (raw_success <= 20 || (raw_success % 120) == 0 || replaced) {
-          LOGI("GraphicBuffer::raw lock fallback #%llu streamId=%d rc=%d %ux%u fmt=%#x bpp=%d stride=%d nv21=%d replaced=%d lock=%.3fms",
-               static_cast<unsigned long long>(raw_success),
-               matched_stream != nullptr ? matched_stream->stream_id : -1, raw_rc,
-               buffer.stream->width, buffer.stream->height, buffer.stream->format,
-               raw_bpp, raw_stride, nv21 ? 1 : 0, replaced ? 1 : 0,
-               ns_to_ms(raw_lock_done_ns - raw_lock_start_ns));
-        }
-        if (unlock_rc != 0) LOGW("GraphicBuffer::raw unlock failed rc=%d", unlock_rc);
-      } else {
-        const uint64_t raw_fail =
-            g_raw_lock_fail_count.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (raw_fail <= 20 || (raw_fail % 120) == 0) {
-          LOGE("GraphicBuffer::raw lock fallback failed #%llu rc=%d streamId=%d %ux%u fmt=%#x bpp=%d stride=%d vaddr=%p",
-               static_cast<unsigned long long>(raw_fail), raw_rc,
-               matched_stream != nullptr ? matched_stream->stream_id : -1,
-               buffer.stream->width, buffer.stream->height, buffer.stream->format,
-               raw_bpp, raw_stride, raw_vaddr);
-        }
-      }
-    }
-    if (replaced && unlock_done_ns == lock_done_ns) {
-      unlock_start_ns = write_done_ns;
-      unlock_done_ns = write_done_ns;
-    }
-  } else {
-    write_start_ns = monotonic_time_ns();
-    replaced = write_i420_to_ycbcr(frame_bytes, frame_size, width, height, layout);
-    write_done_ns = monotonic_time_ns();
-    unlock_start_ns = write_done_ns;
-    const int unlock_rc = g_graphic_buffer_api.unlock(graphic_buffer);
-    unlock_done_ns = monotonic_time_ns();
-    if (unlock_rc != 0) LOGW("GraphicBuffer::unlock failed rc=%d", unlock_rc);
-  }
+  CachedWriteResult write_stats{};
+  const uint64_t write_start_ns = monotonic_time_ns();
+  const bool replaced = try_write_i420_to_graphic_buffer_cached(
+      graphic_buffer, reinterpret_cast<uintptr_t>(anw_buffer), width, height, format,
+      frame_bytes, frame_size, "returnBufferCheckedLocked", &write_stats);
+  const uint64_t write_done_ns = monotonic_time_ns();
 
   g_graphic_buffer_api.dec_strong(graphic_buffer, dec_strong_cookie);
 
@@ -897,15 +1109,15 @@ bool try_replace_camera3_frame(
            buffer.stream->width, buffer.stream->height, buffer.stream->format,
            static_cast<unsigned long long>(frame->generation),
            static_cast<long long>(frame->pts_us), surface_id);
-      LOGI("Perf replace #%llu streamId=%d %ux%u step=%zu from=%.3fms lock=%.3fms write=%.3fms unlock=%.3fms total=%.3fms",
+      LOGI("Perf replace #%llu streamId=%d %ux%u path=%s step=%zu from=%.3fms write=%.3fms total=%.3fms rawStride=%d rawNv21=%d",
            static_cast<unsigned long long>(replace_count),
            matched_stream != nullptr ? matched_stream->stream_id : -1,
-           buffer.stream->width, buffer.stream->height, layout.chroma_step,
+           buffer.stream->width, buffer.stream->height,
+           buffer_lock_path_name(write_stats.path), write_stats.layout.chroma_step,
            ns_to_ms(from_done_ns - from_start_ns),
-           ns_to_ms(lock_done_ns - lock_start_ns),
            ns_to_ms(write_done_ns - write_start_ns),
-           ns_to_ms(unlock_done_ns - unlock_start_ns),
-           ns_to_ms(total_done_ns - total_start_ns));
+           ns_to_ms(total_done_ns - total_start_ns), write_stats.raw_stride,
+           write_stats.raw_nv21 ? 1 : 0);
     }
   }
 
@@ -935,41 +1147,18 @@ bool try_replace_anw_buffer_direct(void *anw_buffer, int width, int height, int 
   void *graphic_buffer = graphic_buffer_ref.ptr;
   if (graphic_buffer == nullptr) return false;
 
-  bool replaced = false;
-  android_ycbcr layout{};
-  const int lock_rc = g_graphic_buffer_api.lock_ycbcr(graphic_buffer,
-                                                      kGraphicBufferCpuLockUsage,
-                                                      &layout);
-  if (lock_rc == 0) {
-    replaced = write_i420_to_ycbcr(frame_bytes, frame_size, width, height, layout);
-    const int unlock_rc = g_graphic_buffer_api.unlock(graphic_buffer);
-    if (unlock_rc != 0) LOGW("%s: queue unlock failed rc=%d", where, unlock_rc);
-  } else {
-    replaced = try_write_i420_to_ahardwarebuffer_planes(
-        graphic_buffer, frame_bytes, frame_size, width, height, where);
-    if (!replaced) {
-      void *raw_vaddr = nullptr;
-      int raw_bpp = 0;
-      int raw_stride = 0;
-      const int raw_rc = g_graphic_buffer_api.lock(graphic_buffer,
-                                                   kGraphicBufferCpuLockUsage,
-                                                   &raw_vaddr, &raw_bpp, &raw_stride);
-      if (raw_rc == 0 && raw_vaddr != nullptr) {
-        replaced = write_i420_to_contiguous_nv(frame_bytes, frame_size, width, height,
-                                               raw_vaddr, raw_stride,
-                                               prefer_raw_nv21_output());
-        const int unlock_rc = g_graphic_buffer_api.unlock(graphic_buffer);
-        if (unlock_rc != 0) LOGW("%s: queue raw unlock failed rc=%d", where, unlock_rc);
-      }
-    }
-  }
+  CachedWriteResult write_stats{};
+  const bool replaced = try_write_i420_to_graphic_buffer_cached(
+      graphic_buffer, reinterpret_cast<uintptr_t>(anw_buffer), width, height, format,
+      frame_bytes, frame_size, where, &write_stats);
 
   g_graphic_buffer_api.dec_strong(graphic_buffer, &graphic_buffer_ref);
   if (replaced) {
     const uint64_t c = g_queue_replaced_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (c <= 20 || (c % 120) == 0) {
-      LOGI("%s replaced queue frame #%llu dst=%dx%d fmt=%#x source=MediaCodecPlayback gen=%llu pts=%lld",
+      LOGI("%s replaced queue frame #%llu dst=%dx%d fmt=%#x path=%s source=MediaCodecPlayback gen=%llu pts=%lld",
            where, static_cast<unsigned long long>(c), width, height, format,
+           buffer_lock_path_name(write_stats.path),
            static_cast<unsigned long long>(frame->generation),
            static_cast<long long>(frame->pts_us));
     }
