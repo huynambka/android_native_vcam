@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
@@ -37,7 +38,9 @@ struct TargetKey {
 };
 
 struct ReadySlot {
-  TargetKey key;
+  std::atomic<int32_t> width{0};
+  std::atomic<int32_t> height{0};
+  std::atomic<int32_t> layout{kReadyFrameLayoutI420};
   std::shared_ptr<const ReadyI420Frame> frame;
 };
 
@@ -50,7 +53,8 @@ struct ScaledI420Cache {
 std::mutex g_ready_mutex;
 std::condition_variable g_ready_cv;
 std::vector<TargetKey> g_targets;
-std::vector<ReadySlot> g_slots;
+std::array<ReadySlot, kMaxReadyTargets> g_slots;
+std::atomic<size_t> g_slot_count{0};
 uint64_t g_last_source_generation = 0;
 std::atomic<uint64_t> g_publish_count{0};
 std::atomic<bool> g_worker_started{false};
@@ -108,6 +112,38 @@ bool IsSupportedReadyLayout(ReadyFrameLayout layout) {
 bool same_key(const TargetKey &key, int32_t width, int32_t height,
               ReadyFrameLayout layout) {
   return key.width == width && key.height == height && key.layout == layout;
+}
+
+bool slot_matches(const ReadySlot &slot, int32_t width, int32_t height,
+                  ReadyFrameLayout layout) {
+  return slot.width.load(std::memory_order_acquire) == width &&
+         slot.height.load(std::memory_order_acquire) == height &&
+         slot.layout.load(std::memory_order_acquire) == static_cast<int32_t>(layout);
+}
+
+int find_ready_slot_index(int32_t width, int32_t height, ReadyFrameLayout layout) {
+  const size_t count = std::min(g_slot_count.load(std::memory_order_acquire),
+                                kMaxReadyTargets);
+  for (size_t i = 0; i < count; ++i) {
+    if (slot_matches(g_slots[i], width, height, layout)) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+bool ensure_ready_slot_locked(int32_t width, int32_t height, ReadyFrameLayout layout) {
+  if (find_ready_slot_index(width, height, layout) >= 0) return true;
+  const size_t index = g_slot_count.load(std::memory_order_acquire);
+  if (index >= kMaxReadyTargets) return false;
+  auto &slot = g_slots[index];
+  std::shared_ptr<const ReadyI420Frame> empty;
+  std::atomic_store_explicit(&slot.frame, empty, std::memory_order_release);
+  slot.width.store(width, std::memory_order_release);
+  slot.height.store(height, std::memory_order_release);
+  slot.layout.store(static_cast<int32_t>(layout), std::memory_order_release);
+  g_slot_count.store(index + 1, std::memory_order_release);
+  return true;
 }
 
 void compute_center_crop(int src_w, int src_h, int dst_w, int dst_h, int *crop_x,
@@ -344,28 +380,22 @@ ScaledI420Cache *find_or_build_scaled_i420(std::vector<ScaledI420Cache> *cache,
   return &cache->back();
 }
 
-void store_ready_frame_locked(std::shared_ptr<const ReadyI420Frame> frame) {
+void store_ready_frame(std::shared_ptr<const ReadyI420Frame> frame) {
   if (!frame) return;
-  for (auto &slot : g_slots) {
-    if (same_key(slot.key, frame->width, frame->height,
-                 static_cast<ReadyFrameLayout>(frame->layout))) {
-      slot.frame = std::move(frame);
-      return;
-    }
+  const int index = find_ready_slot_index(frame->width, frame->height,
+                                          static_cast<ReadyFrameLayout>(frame->layout));
+  if (index >= 0) {
+    std::atomic_store_explicit(&g_slots[static_cast<size_t>(index)].frame,
+                               frame, std::memory_order_release);
   }
-  g_slots.push_back(ReadySlot{TargetKey{frame->width, frame->height,
-                                        static_cast<ReadyFrameLayout>(frame->layout)},
-                              std::move(frame)});
 }
 
 bool cache_has_fresh_frame_locked(const TargetKey &target, uint64_t generation) {
-  for (const auto &slot : g_slots) {
-    if (same_key(slot.key, target.width, target.height, target.layout) && slot.frame &&
-        slot.frame->generation == generation) {
-      return true;
-    }
-  }
-  return false;
+  const int index = find_ready_slot_index(target.width, target.height, target.layout);
+  if (index < 0) return false;
+  auto frame = std::atomic_load_explicit(
+      &g_slots[static_cast<size_t>(index)].frame, std::memory_order_acquire);
+  return frame && frame->generation == generation;
 }
 
 bool BuildAndStoreLatestSource() {
@@ -427,7 +457,7 @@ bool BuildAndStoreLatestSource() {
 
   {
     std::lock_guard<std::mutex> lock(g_ready_mutex);
-    for (auto &frame : built_frames) store_ready_frame_locked(std::move(frame));
+    for (auto &frame : built_frames) store_ready_frame(std::move(frame));
     g_last_source_generation = source.generation;
   }
   const uint64_t count = g_publish_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -485,6 +515,11 @@ void RegisterReadyFrameOutputLayout(int32_t width, int32_t height,
            width, height, LayoutName(layout));
       return;
     }
+    if (!ensure_ready_slot_locked(width, height, layout)) {
+      LOGW("ReadyFrameCache slot full; ignore %dx%d layout=%s",
+           width, height, LayoutName(layout));
+      return;
+    }
     g_targets.push_back(TargetKey{width, height, layout});
     LOGI("ReadyFrameCache registered target %dx%d layout=%s count=%zu", width, height,
          LayoutName(layout), g_targets.size());
@@ -501,17 +536,27 @@ std::shared_ptr<const ReadyI420Frame> GetReadyFrameForLayout(
     int32_t width, int32_t height, ReadyFrameLayout layout) {
   if (width <= 0 || height <= 0) return nullptr;
   if (!IsSupportedReadyLayout(layout)) return nullptr;
-  std::lock_guard<std::mutex> lock(g_ready_mutex);
-  for (const auto &slot : g_slots) {
-    if (same_key(slot.key, width, height, layout)) return slot.frame;
-  }
-  return nullptr;
+  const int index = find_ready_slot_index(width, height, layout);
+  if (index < 0) return nullptr;
+  return std::atomic_load_explicit(&g_slots[static_cast<size_t>(index)].frame,
+                                   std::memory_order_acquire);
 }
 
 void ClearReadyFrameCache() {
   {
     std::lock_guard<std::mutex> lock(g_ready_mutex);
-    g_slots.clear();
+    const size_t count = std::min(g_slot_count.load(std::memory_order_acquire),
+                                  kMaxReadyTargets);
+    std::shared_ptr<const ReadyI420Frame> empty;
+    for (size_t i = 0; i < count; ++i) {
+      std::atomic_store_explicit(&g_slots[i].frame, empty,
+                                 std::memory_order_release);
+      g_slots[i].width.store(0, std::memory_order_release);
+      g_slots[i].height.store(0, std::memory_order_release);
+      g_slots[i].layout.store(static_cast<int32_t>(kReadyFrameLayoutI420),
+                              std::memory_order_release);
+    }
+    g_slot_count.store(0, std::memory_order_release);
     g_targets.clear();
     g_last_source_generation = 0;
   }
