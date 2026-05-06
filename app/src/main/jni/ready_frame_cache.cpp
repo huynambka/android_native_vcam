@@ -43,6 +43,8 @@ std::vector<ReadySlot> g_slots;
 uint64_t g_last_source_generation = 0;
 std::atomic<uint64_t> g_publish_count{0};
 std::atomic<bool> g_worker_started{false};
+std::atomic<int> g_verbose_enabled{0};
+std::atomic<uint64_t> g_verbose_last_refresh_ns{0};
 
 uint64_t now_ns() {
   struct timespec ts {};
@@ -52,6 +54,25 @@ uint64_t now_ns() {
 }
 
 double ns_to_ms(uint64_t ns) { return static_cast<double>(ns) / 1000000.0; }
+
+bool VerboseLoggingEnabled() {
+  const uint64_t now = now_ns();
+  uint64_t last = g_verbose_last_refresh_ns.load(std::memory_order_acquire);
+  if (last == 0 || now - last >= 1000000000ULL) {
+    if (g_verbose_last_refresh_ns.compare_exchange_strong(
+            last, now, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      g_verbose_enabled.store(access("/data/camera/awesomecam_verbose", F_OK) == 0 ? 1 : 0,
+                              std::memory_order_release);
+    }
+  }
+  return g_verbose_enabled.load(std::memory_order_acquire) != 0;
+}
+
+bool ShouldLogCounter(uint64_t count, uint64_t verbose_first = 10,
+                      uint64_t rare_every = 120) {
+  return (rare_every != 0 && (count % rare_every) == 0) ||
+         (VerboseLoggingEnabled() && count <= verbose_first);
+}
 
 size_t chroma_width_for(int width) { return static_cast<size_t>((width + 1) / 2); }
 size_t chroma_height_for(int height) { return static_cast<size_t>((height + 1) / 2); }
@@ -305,7 +326,7 @@ void BuildAndStoreLatestSource() {
     g_last_source_generation = source.generation;
   }
   const uint64_t count = g_publish_count.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (count <= 10 || (count % 120) == 0) {
+  if (ShouldLogCounter(count, 10, 120)) {
     LOGI("ReadyFrameCache built sourceGen=%llu src=%dx%d targets=%zu built=%zu ms=%.3f",
          static_cast<unsigned long long>(source.generation), source.width, source.height,
          targets.size(), built_frames.size(), ns_to_ms(now_ns() - perf_start_ns));

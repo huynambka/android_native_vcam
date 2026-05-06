@@ -129,6 +129,7 @@ constexpr uint64_t kWriteModeRefreshIntervalNs = kNsPerSecond;
 constexpr size_t kMaxBufferLockCacheEntries = 128;
 constexpr const char *kWriteAllFlagPath = "/data/camera/awesomecam_write_all";
 constexpr const char *kWriteCamera3FlagPath = "/data/camera/awesomecam_write_camera3";
+constexpr const char *kVerboseFlagPath = "/data/camera/awesomecam_verbose";
 
 enum class WriteMode : int {
   kSurfaceOnly = 0,
@@ -249,6 +250,8 @@ std::atomic<uint64_t> g_ahb_lock_fail_count{0};
 std::atomic<uint64_t> g_ahb_lock_success_count{0};
 std::atomic<int> g_write_mode{static_cast<int>(WriteMode::kSurfaceOnly)};
 std::atomic<uint64_t> g_write_mode_last_refresh_ns{0};
+std::atomic<uint64_t> g_verbose_last_refresh_ns{0};
+std::atomic<int> g_verbose_enabled{0};
 
 void *g_camera3device_create_stream_stub = nullptr;
 void *g_return_buffer_checked_locked_stub = nullptr;
@@ -272,6 +275,25 @@ uint64_t monotonic_time_ns() {
 
 double ns_to_ms(uint64_t ns) {
   return static_cast<double>(ns) / 1000000.0;
+}
+
+bool verbose_logging_enabled() {
+  const uint64_t now_ns = monotonic_time_ns();
+  uint64_t last_ns = g_verbose_last_refresh_ns.load(std::memory_order_acquire);
+  if (last_ns == 0 || now_ns - last_ns >= kNsPerSecond) {
+    if (g_verbose_last_refresh_ns.compare_exchange_strong(
+            last_ns, now_ns, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      g_verbose_enabled.store(access(kVerboseFlagPath, F_OK) == 0 ? 1 : 0,
+                              std::memory_order_release);
+    }
+  }
+  return g_verbose_enabled.load(std::memory_order_acquire) != 0;
+}
+
+bool should_log_counter(uint64_t count, uint64_t verbose_first = 20,
+                        uint64_t rare_every = 120) {
+  return (rare_every != 0 && (count % rare_every) == 0) ||
+         (verbose_logging_enabled() && count <= verbose_first);
 }
 
 const char *write_mode_name(WriteMode mode) {
@@ -441,7 +463,7 @@ void record_buffer_lock_path(uintptr_t anw_buffer, int width, int height, int fo
     snapshot = *it;
   }
 
-  if (success && (added || snapshot.updates <= 3 || (snapshot.updates % 120) == 0)) {
+  if (success && (added || should_log_counter(snapshot.updates, 3, 120))) {
     LOGI("%s buffer lock cache %dx%d fmt=%#x anw=%p preferred=%s failed[y=%d ahb=%d raw=%d]",
          where != nullptr ? where : "replace", width, height, format,
          reinterpret_cast<void *>(anw_buffer), buffer_lock_path_name(snapshot.preferred),
@@ -750,7 +772,7 @@ bool wait_fence_if_valid(int fence_fd, const char *where, int timeout_ms) {
   if (rc == 0) {
     const uint64_t timeout_count =
         g_fence_wait_timeout_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (timeout_count <= 20 || (timeout_count % 120) == 0) {
+    if (should_log_counter(timeout_count, 20, 120)) {
       LOGW("%s fence wait timeout #%llu fd=%d timeout=%dms waited=%.3fms",
            where != nullptr ? where : "replace",
            static_cast<unsigned long long>(timeout_count), fence_fd, poll_timeout_ms,
@@ -760,14 +782,14 @@ bool wait_fence_if_valid(int fence_fd, const char *where, int timeout_ms) {
   }
 
   if (rc < 0) {
-    if (count <= 20 || (count % 120) == 0) {
+    if (should_log_counter(count, 20, 120)) {
       LOGW("%s fence wait failed fd=%d errno=%d (%s)",
            where != nullptr ? where : "replace", fence_fd, errno, strerror(errno));
     }
     return false;
   }
 
-  if (count <= 20 || (count % 120) == 0) {
+  if (should_log_counter(count, 20, 120)) {
     LOGI("%s fence signaled #%llu fd=%d waited=%.3fms revents=%#x",
          where != nullptr ? where : "replace",
          static_cast<unsigned long long>(count), fence_fd,
@@ -1027,7 +1049,7 @@ bool try_write_i420_to_ahardwarebuffer_planes(void *graphic_buffer,
   if (lock_rc != 0 || planes.planeCount == 0) {
     const uint64_t fail =
         g_ahb_lock_fail_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (fail <= 20 || (fail % 120) == 0) {
+    if (should_log_counter(fail, 20, 120)) {
       LOGW("%s AHardwareBuffer_lockPlanes failed #%llu rc=%d planes=%u %dx%d",
            where != nullptr ? where : "replace",
            static_cast<unsigned long long>(fail), lock_rc, planes.planeCount,
@@ -1068,7 +1090,7 @@ bool try_write_i420_to_ahardwarebuffer_planes(void *graphic_buffer,
   if (replaced) {
     const uint64_t success =
         g_ahb_lock_success_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (success <= 20 || (success % 120) == 0) {
+    if (should_log_counter(success, 20, 120)) {
       LOGI("%s AHardwareBuffer_lockPlanes write #%llu planes=%u yStride=%u cStride=%u cStep=%u %dx%d lock=%.3fms",
            where != nullptr ? where : "replace",
            static_cast<unsigned long long>(success), planes.planeCount,
@@ -1092,7 +1114,7 @@ bool try_write_i420_to_ycbcr_lock(void *graphic_buffer, const uint8_t *frame_byt
   if (lock_rc != 0) {
     const uint64_t fail_count =
         g_lock_ycbcr_fail_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (fail_count <= 20 || (fail_count % 120) == 0) {
+    if (should_log_counter(fail_count, 20, 120)) {
       LOGE("%s GraphicBuffer::lockYCbCr failed #%llu rc=%d for %dx%d",
            where != nullptr ? where : "replace",
            static_cast<unsigned long long>(fail_count), lock_rc, width, height);
@@ -1129,7 +1151,7 @@ bool try_write_i420_to_raw_lock(void *graphic_buffer, const uint8_t *frame_bytes
   if (raw_rc != 0 || raw_vaddr == nullptr) {
     const uint64_t raw_fail =
         g_raw_lock_fail_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (raw_fail <= 20 || (raw_fail % 120) == 0) {
+    if (should_log_counter(raw_fail, 20, 120)) {
       LOGE("%s GraphicBuffer::raw lock failed #%llu rc=%d %dx%d bpp=%d stride=%d vaddr=%p",
            where != nullptr ? where : "replace",
            static_cast<unsigned long long>(raw_fail), raw_rc, width, height,
@@ -1149,7 +1171,7 @@ bool try_write_i420_to_raw_lock(void *graphic_buffer, const uint8_t *frame_bytes
   }
   const uint64_t raw_success =
       g_raw_lock_success_count.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (raw_success <= 20 || (raw_success % 120) == 0 || replaced) {
+  if (should_log_counter(raw_success, 20, 120)) {
     LOGI("%s GraphicBuffer::raw lock #%llu %dx%d bpp=%d stride=%d nv21=%d replaced=%d lock=%.3fms",
          where != nullptr ? where : "replace",
          static_cast<unsigned long long>(raw_success), width, height, raw_bpp,
@@ -1267,7 +1289,7 @@ bool try_replace_camera3_frame(
   if (replaced) {
     const uint64_t replace_count =
         g_replaced_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (replace_count <= 10 || (replace_count % 120) == 0) {
+    if (should_log_counter(replace_count, 10, 120)) {
       const uint64_t total_done_ns = monotonic_time_ns();
       LOGI("Replaced frame #%llu streamId=%d dst=%ux%u fmt=%#x source=MediaCodecPlayback gen=%llu pts=%lld surfaceId=%d",
            static_cast<unsigned long long>(replace_count),
@@ -1321,7 +1343,7 @@ bool try_replace_anw_buffer_direct(void *anw_buffer, int width, int height, int 
   g_graphic_buffer_api.dec_strong(graphic_buffer, &graphic_buffer_ref);
   if (replaced) {
     const uint64_t c = g_queue_replaced_frame_count.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (c <= 20 || (c % 120) == 0) {
+    if (should_log_counter(c, 20, 120)) {
       LOGI("%s replaced queue frame #%llu dst=%dx%d fmt=%#x path=%s source=MediaCodecPlayback gen=%llu pts=%lld",
            where, static_cast<unsigned long long>(c), width, height, format,
            buffer_lock_path_name(write_stats.path),
@@ -1372,7 +1394,7 @@ int hook_queue_buffer_to_consumer(void *thiz, void *consumer_sp, void *anw_buffe
     const int width = prefix->width;
     const int height = prefix->height;
     const int format = prefix->format;
-    if (count <= 20 || (count % 120) == 0) {
+    if (should_log_counter(count, 20, 120)) {
       LOGI("queueBufferToConsumer hit #%llu anw=%p %dx%d stride=%d fmt=%#x usage=%#" PRIx64,
            static_cast<unsigned long long>(count), anw_buffer, width, height,
            prefix->stride, format, prefix->usage);
@@ -1388,7 +1410,7 @@ int hook_queue_buffer_to_consumer(void *thiz, void *consumer_sp, void *anw_buffe
       (void)try_replace_anw_buffer_direct(anw_buffer, width, height, format,
                                           "queueBufferToConsumer");
     }
-  } else if (count <= 20) {
+  } else if (should_log_counter(count, 20, 0)) {
     LOGI("queueBufferToConsumer hit #%llu anw=null", static_cast<unsigned long long>(count));
   }
 
@@ -1407,7 +1429,7 @@ int hook_surface_set_usage(void *thiz, uint64_t usage) {
   const uint64_t forced_usage = usage | kGrallocUsageCpuReadWriteOften;
   const uint64_t count =
       g_surface_set_usage_hit_count.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (count <= 30 || usage != forced_usage || (count % 120) == 0) {
+  if (usage != forced_usage || should_log_counter(count, 30, 120)) {
     LOGI("Surface::setUsage hit #%llu this=%p usage=%#" PRIx64 "->%#" PRIx64,
          static_cast<unsigned long long>(count), thiz, usage, forced_usage);
   }
@@ -1426,7 +1448,7 @@ int hook_surface_hook_queue_buffer(void *window, void *anw_buffer, int fence_fd)
     const int width = prefix->width;
     const int height = prefix->height;
     const int format = prefix->format;
-    if (count <= 20 || (count % 120) == 0) {
+    if (should_log_counter(count, 20, 120)) {
       LOGI("Surface::hook_queueBuffer hit #%llu window=%p anw=%p %dx%d stride=%d fmt=%#x usage=%#" PRIx64,
            static_cast<unsigned long long>(count), window, anw_buffer, width, height,
            prefix->stride, format, prefix->usage);
@@ -1440,7 +1462,7 @@ int hook_surface_hook_queue_buffer(void *window, void *anw_buffer, int fence_fd)
                                             "Surface::hook_queueBuffer");
       }
     }
-  } else if (count <= 20) {
+  } else if (should_log_counter(count, 20, 0)) {
     LOGI("Surface::hook_queueBuffer hit #%llu anw=null", static_cast<unsigned long long>(count));
   }
   return orig(window, anw_buffer, fence_fd);
@@ -1534,21 +1556,21 @@ int hook_return_buffer_checked_locked(
                                               stream->format, stream->data_space,
                                               &matched, &per_stream_log_count);
     if (found_match) {
-      if (per_stream_log_count <= 5) {
+      if (should_log_counter(per_stream_log_count, 5, 120)) {
         LOGI("returnBufferCheckedLocked hit #%llu streamId=%d width=%u height=%u format=%#x dataspace=%#x usage=%#" PRIx64 " output=%d surfaceArg=%p surfaceId=%d ts=%ld readoutTs=%ld",
              static_cast<unsigned long long>(count), matched.stream_id, stream->width,
              stream->height, stream->format, stream->data_space, stream->usage,
              output, surface_ids_or_legacy_id, surface_id_for_log, timestamp,
              readout_timestamp);
       }
-    } else if (count <= 12) {
+    } else if (should_log_counter(count, 12, 0)) {
       LOGI("returnBufferCheckedLocked hit #%llu unmatched width=%u height=%u format=%#x dataspace=%#x usage=%#" PRIx64 " output=%d surfaceArg=%p surfaceId=%d ts=%ld readoutTs=%ld",
            static_cast<unsigned long long>(count), stream->width, stream->height,
            stream->format, stream->data_space, stream->usage, output,
            surface_ids_or_legacy_id, surface_id_for_log, timestamp,
            readout_timestamp);
     }
-  } else if (count <= 12) {
+  } else if (should_log_counter(count, 12, 0)) {
     LOGI("returnBufferCheckedLocked hit #%llu stream=null output=%d surfaceArg=%p surfaceId=%d ts=%ld readoutTs=%ld",
          static_cast<unsigned long long>(count), output, surface_ids_or_legacy_id,
          surface_id_for_log, timestamp, readout_timestamp);

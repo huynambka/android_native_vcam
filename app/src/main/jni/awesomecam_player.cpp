@@ -35,6 +35,8 @@
 namespace {
 
 std::atomic<bool> g_stop{false};
+std::atomic<int> g_verbose_enabled{0};
+std::atomic<int64_t> g_verbose_last_refresh_us{0};
 
 constexpr int32_t kColorFormatYuv420Planar = 19;
 constexpr int32_t kColorFormatYuv420PackedPlanar = 20;
@@ -168,6 +170,25 @@ int64_t MonotonicUs() {
   timespec ts{};
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<int64_t>(ts.tv_sec) * 1000000LL + ts.tv_nsec / 1000LL;
+}
+
+bool VerboseLoggingEnabled() {
+  const int64_t now_us = MonotonicUs();
+  int64_t last_us = g_verbose_last_refresh_us.load(std::memory_order_acquire);
+  if (last_us == 0 || now_us - last_us >= 1000000LL) {
+    if (g_verbose_last_refresh_us.compare_exchange_strong(
+            last_us, now_us, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      g_verbose_enabled.store(access("/data/camera/awesomecam_verbose", F_OK) == 0 ? 1 : 0,
+                              std::memory_order_release);
+    }
+  }
+  return g_verbose_enabled.load(std::memory_order_acquire) != 0;
+}
+
+bool ShouldLogCounter(uint64_t count, uint64_t verbose_first = 5,
+                      uint64_t rare_every = 120) {
+  return (rare_every != 0 && (count % rare_every) == 0) ||
+         (VerboseLoggingEnabled() && count <= verbose_first);
 }
 
 size_t ChromaWidth(int32_t width) { return static_cast<size_t>((width + 1) / 2); }
@@ -1021,7 +1042,7 @@ bool QueueExtractorInput(AMediaCodec *codec, AMediaExtractor *extractor, bool *i
     return false;
   }
   const uint64_t count = queued_input_count.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (count <= 5 || (count % 120) == 0) {
+  if (ShouldLogCounter(count, 5, 120)) {
     LOGI("MediaCodecPlayer: queued input #%llu idx=%zd size=%zd cap=%zu pts=%lld",
          static_cast<unsigned long long>(count), input_index, sample_size, capacity,
          static_cast<long long>(pts_us));
@@ -1227,7 +1248,7 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
           ShouldDropForFpsCap(opt, pts_us, clock_started, base_wall_us,
                               base_pts_us, last_published_pts_us)) {
         dropped += 1;
-        if (dropped <= 5 || (dropped % 120) == 0) {
+        if (ShouldLogCounter(dropped, 5, 120)) {
           LOGI("MediaCodecPlayer: dropped decoded frame #%llu cap=%d pts=%lld lastPts=%lld input=%s",
                static_cast<unsigned long long>(dropped), opt.fps_cap,
                static_cast<long long>(pts_us),
@@ -1265,7 +1286,7 @@ DecodeOutcome DecodeOnce(const Options &opt, BinderClient *binder,
       last_published_pts_us = pts_us;
       decoded += 1;
       fps_frames += 1;
-      if (decoded <= 5 || (decoded % 120) == 0) {
+      if (ShouldLogCounter(decoded, 5, 120)) {
         LOGI("MediaCodecPlayer: wrote source frame #%llu gen=%llu slot=%u out=%dx%d pts=%lld",
              static_cast<unsigned long long>(decoded),
              static_cast<unsigned long long>(ring.next_generation),

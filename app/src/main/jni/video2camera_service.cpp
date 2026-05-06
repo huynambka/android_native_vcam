@@ -72,6 +72,8 @@ std::atomic<bool> g_service_registered{false};
 std::atomic<bool> g_service_launching{false};
 std::atomic<bool> g_probe_c51_launching{false};
 std::atomic<bool> g_probe_c52_launching{false};
+std::atomic<int> g_verbose_enabled{0};
+std::atomic<uint64_t> g_verbose_last_refresh_ns{0};
 AIBinder_Class *g_service_class = nullptr;
 AIBinder *g_service_binder = nullptr;
 
@@ -113,6 +115,25 @@ uint64_t MonotonicNs() {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return static_cast<uint64_t>(ts.tv_sec) * kNsPerSecond +
          static_cast<uint64_t>(ts.tv_nsec);
+}
+
+bool VerboseLoggingEnabled() {
+  const uint64_t now = MonotonicNs();
+  uint64_t last = g_verbose_last_refresh_ns.load(std::memory_order_acquire);
+  if (last == 0 || now - last >= kNsPerSecond) {
+    if (g_verbose_last_refresh_ns.compare_exchange_strong(
+            last, now, std::memory_order_acq_rel, std::memory_order_acquire)) {
+      g_verbose_enabled.store(access("/data/camera/awesomecam_verbose", F_OK) == 0 ? 1 : 0,
+                              std::memory_order_release);
+    }
+  }
+  return g_verbose_enabled.load(std::memory_order_acquire) != 0;
+}
+
+bool ShouldLogCounter(uint64_t count, uint64_t verbose_first = 5,
+                      uint64_t rare_every = 120) {
+  return (rare_every != 0 && (count % rare_every) == 0) ||
+         (VerboseLoggingEnabled() && count <= verbose_first);
 }
 
 bool IsSupportedTargetFormat(int32_t format) {
@@ -402,7 +423,7 @@ void UpdateVideo2CameraTarget(int32_t width, int32_t height, int32_t format) {
     if (!SameTargetKey(target, width, height, format)) continue;
     target.last_seen_ns = now_ns;
     target.hit_count += 1;
-    if (target.hit_count <= 5 || (target.hit_count % 120) == 0) {
+    if (ShouldLogCounter(target.hit_count, 5, 120)) {
       LOGI("Video2CameraService target hit gen=%llu %dx%d fmt=%#x hits=%llu",
            static_cast<unsigned long long>(target.generation), width, height, format,
            static_cast<unsigned long long>(target.hit_count));
