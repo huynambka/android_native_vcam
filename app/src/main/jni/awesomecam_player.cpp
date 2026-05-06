@@ -1242,7 +1242,11 @@ bool OpenRtmpInput(const std::string &url_file, RtmpInput *rtmp,
   av_log_set_level(AV_LOG_QUIET);
   AVDictionary *opts = nullptr;
   av_dict_set(&opts, "rw_timeout", "5000000", 0);
-  av_dict_set(&opts, "timeout", "5000000", 0);
+  // Do not set RTMP protocol option "timeout" here: for FFmpeg RTMP it is a
+  // listen/accept timeout and implies server/listen mode.  In adb reverse
+  // setups that makes avformat try to bind 127.0.0.1:1935 and fail with
+  // EADDRINUSE instead of connecting to the forwarded host server.
+  av_dict_set(&opts, "rtmp_live", "live", 0);
   av_dict_set(&opts, "fflags", "nobuffer", 0);
   av_dict_set(&opts, "flags", "low_delay", 0);
 
