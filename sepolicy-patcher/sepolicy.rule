@@ -26,11 +26,11 @@ allow cameraserver cameraserver process execmem
 # cameraserver registers Video2CameraService.
 allow cameraserver default_android_service service_manager add
 
-# awesomeCAM app connects to Video2CameraService.
+# awesomeCAM app connects to Video2CameraService and transfers an ASharedMemory FD.
 allow untrusted_app default_android_service service_manager find
+allow cameraserver untrusted_app fd use
 
-# Native-player path:
-# cameraserver opens /data/camera/input.mp4 and passes fd to media.extractor.
+# App-native MP4 decode path: app reads /data/camera/input.mp4; legacy cameraserver/mediaextractor read rules are retained harmlessly.
 allow cameraserver awesomecam_source_file file { open read getattr map ioctl lock }
 # cameraserver scanner saves discovered offsets here.
 allow cameraserver awesomecam_config_file file { create open read write getattr setattr append map }
@@ -46,3 +46,8 @@ allow mediaextractor awesomecam_source_file file { open read getattr map ioctl l
 allow untrusted_app system_data_root_file dir search
 allow untrusted_app system_data_file dir { search open read getattr }
 allow untrusted_app awesomecam_source_file file { open read getattr map ioctl lock }
+
+# Root FFmpeg player process talks to the cameraserver service and passes one source-ring FD.
+allow su default_android_service service_manager find
+allow su cameraserver binder { call transfer }
+allow cameraserver su fd use

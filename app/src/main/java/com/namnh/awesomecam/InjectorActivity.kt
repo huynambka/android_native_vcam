@@ -47,9 +47,10 @@ class InjectorActivity : AppCompatActivity() {
         title = buildIdentity
 
         TelemetryStore.setInitialStatusIfEmpty(
-            "Build: $buildIdentity\n\nRequired assets: $HELPER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
+            "Build: $buildIdentity\n\nRequired assets: $HELPER_ASSET, $PLAYER_ASSET, $SHADOWHOOK_LIB_NAME, $HOOK_ASSET\n" +
                 "Stage 1: $RUNTIME_DIR/$SHADOWHOOK_LIB_NAME\n" +
-                "Stage 2: $RUNTIME_DIR/$HOOK_ASSET (call main_hook)\n\n" +
+                "Stage 2: $RUNTIME_DIR/$HOOK_ASSET (call main_hook)\n" +
+                "Player: $RUNTIME_DIR/$PLAYER_ASSET + FFmpeg libs\n\n" +
                 "File source: ${Mp4FeedController.DEFAULT_VIDEO_PATH}",
         )
 
@@ -57,7 +58,12 @@ class InjectorActivity : AppCompatActivity() {
             runAsync {
                 appendStatus("Preparing runtime files")
                 val localHelper = extractAsset(HELPER_ASSET)
-                // libhook.so must come from APK native lib/, not assets/.
+                val localPlayer = extractAsset(PLAYER_ASSET)
+                val localFfmpegLibs = FFMPEG_LIB_NAMES.mapNotNull { extractOptionalBundledNativeLib(it) }
+                require(localFfmpegLibs.any { it.name == "libffmpeg.so" }) {
+                    "Missing bundled FFmpeg libffmpeg.so in APK"
+                }
+                // libhook.so must come from APK native lib/.
                 // AGP packages assets before CMake refreshes app/src/main/assets/libhook.so,
                 // so assets/libhook.so can be one build stale and crash cameraserver.
                 val localHook = extractBundledNativeLib(HOOK_ASSET)
@@ -65,11 +71,11 @@ class InjectorActivity : AppCompatActivity() {
 
                 appendStatus(
                     "App-private staging ready:\n" +
-                        (listOf(localHelper.absolutePath, localHook.absolutePath) +
-                            listOf(localShadowHook.absolutePath))
+                        (listOf(localHelper.absolutePath, localPlayer.absolutePath, localHook.absolutePath) +
+                            listOf(localShadowHook.absolutePath) + localFfmpegLibs.map { it.absolutePath })
                             .joinToString("\n"),
                 )
-                val commands = buildRuntimeCommands(localHelper, localShadowHook, localHook)
+                val commands = buildRuntimeCommands(localHelper, localPlayer, localShadowHook, localHook, localFfmpegLibs)
 
                 appendStatus("Running injector as root")
                 appendStatus(runRoot(commands))
@@ -114,11 +120,6 @@ class InjectorActivity : AppCompatActivity() {
         super.onStop()
     }
 
-    override fun onDestroy() {
-        feedController.stop()
-        super.onDestroy()
-    }
-
     private fun buildIdentityLabel(): String {
         return "awesomeCAM ${BuildConfig.VERSION_NAME} · ${BuildConfig.ARCH_LABEL} · ${BuildConfig.GIT_SHA} · ${BuildConfig.BUILD_STAMP}"
     }
@@ -153,6 +154,11 @@ class InjectorActivity : AppCompatActivity() {
     }
 
     private fun extractBundledNativeLib(libName: String): File {
+        return extractOptionalBundledNativeLib(libName)
+            ?: error("Missing bundled native lib in APK: $libName")
+    }
+
+    private fun extractOptionalBundledNativeLib(libName: String): File? {
         val outFile = File(filesDir, libName)
 
         val abiCandidates = buildList {
@@ -168,7 +174,7 @@ class InjectorActivity : AppCompatActivity() {
                 .asSequence()
                 .mapNotNull { path -> zip.getEntry(path) }
                 .firstOrNull()
-                ?: error("Missing bundled native lib in APK: $libName")
+                ?: return null
 
             zip.getInputStream(entry).use { input ->
                 outFile.outputStream().use { output ->
@@ -180,23 +186,36 @@ class InjectorActivity : AppCompatActivity() {
         return outFile
     }
 
-    private fun buildRuntimeCommands(helper: File, shadowHook: File, hook: File): List<String> {
+    private fun buildRuntimeCommands(
+        helper: File,
+        player: File,
+        shadowHook: File,
+        hook: File,
+        ffmpegLibs: List<File>,
+    ): List<String> {
         val helperDst = "$RUNTIME_DIR/$HELPER_ASSET"
+        val playerDst = "$RUNTIME_DIR/$PLAYER_ASSET"
         val shadowHookDst = "$RUNTIME_DIR/$SHADOWHOOK_LIB_NAME"
         val hookDst = "$RUNTIME_DIR/$HOOK_ASSET"
-        val offsetConfigDst = "$RUNTIME_DIR/$OFFSET_CONFIG_NAME"
 
         return buildList {
             add("mkdir -p ${shellQuote(RUNTIME_DIR)}")
-            add("touch ${shellQuote(offsetConfigDst)}")
-            add("chmod 0666 ${shellQuote(offsetConfigDst)}")
-            add("chcon u:object_r:awesomecam_config_file:s0 ${shellQuote(offsetConfigDst)} || true")
             add("cp ${shellQuote(helper.absolutePath)} ${shellQuote(helperDst)}")
+            add("cp ${shellQuote(player.absolutePath)} ${shellQuote(playerDst)}")
+            for (lib in ffmpegLibs) {
+                add("cp ${shellQuote(lib.absolutePath)} ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
+            }
             add("cp ${shellQuote(shadowHook.absolutePath)} ${shellQuote(shadowHookDst)}")
             add("cp ${shellQuote(hook.absolutePath)} ${shellQuote(hookDst)}")
-            add("chmod 0755 ${shellQuote(helperDst)}")
+            add("chmod 0755 ${shellQuote(helperDst)} ${shellQuote(playerDst)}")
             add("chmod 0644 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
-            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
+            for (lib in ffmpegLibs) {
+                add("chmod 0644 ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
+            }
+            add("chcon u:object_r:system_lib_file:s0 ${shellQuote(playerDst)} ${shellQuote(shadowHookDst)} ${shellQuote(hookDst)}")
+            for (lib in ffmpegLibs) {
+                add("chcon u:object_r:system_lib_file:s0 ${shellQuote("$RUNTIME_DIR/${lib.name}")}")
+            }
             // Do not wrap with `sh -c`.
             //
             // KernelSU keeps the top-level `su` command in u:r:su:s0, but a nested
@@ -242,8 +261,17 @@ class InjectorActivity : AppCompatActivity() {
     companion object {
         private const val RUNTIME_DIR = "/data/camera"
         private const val HELPER_ASSET = "injector_helper"
+        private const val PLAYER_ASSET = "awesomecam_player"
         private const val HOOK_ASSET = "libhook.so"
         private const val SHADOWHOOK_LIB_NAME = "libshadowhook.so"
-        private const val OFFSET_CONFIG_NAME = "awesomecam_offsets.conf"
+        private val FFMPEG_LIB_NAMES = listOf(
+            "libffmpeg.so",
+            "libffmpegexe.so",
+            "libavformat.so",
+            "libavcodec.so",
+            "libavutil.so",
+            "libswscale.so",
+            "libswresample.so",
+        )
     }
 }

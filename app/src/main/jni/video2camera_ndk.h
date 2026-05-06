@@ -24,6 +24,10 @@ using FnAIBinderTransact = binder_status_t (*)(AIBinder *, transaction_code_t, A
 using FnAParcelDelete = void (*)(AParcel *);
 using FnAParcelReadInt32 = binder_status_t (*)(const AParcel *, int32_t *);
 using FnAParcelWriteInt32 = binder_status_t (*)(AParcel *, int32_t);
+using FnAParcelReadInt64 = binder_status_t (*)(const AParcel *, int64_t *);
+using FnAParcelWriteInt64 = binder_status_t (*)(AParcel *, int64_t);
+using FnAParcelReadParcelFileDescriptor = binder_status_t (*)(const AParcel *, int *);
+using FnAParcelWriteParcelFileDescriptor = binder_status_t (*)(AParcel *, int);
 using FnAParcelReadByteArray = binder_status_t (*)(const AParcel *, void *,
                                                    AParcel_byteArrayAllocator);
 using FnAParcelWriteByteArray = binder_status_t (*)(AParcel *, const int8_t *, int32_t);
@@ -45,6 +49,10 @@ struct BinderRuntimeApi {
   FnAParcelDelete parcel_delete = nullptr;
   FnAParcelReadInt32 parcel_read_int32 = nullptr;
   FnAParcelWriteInt32 parcel_write_int32 = nullptr;
+  FnAParcelReadInt64 parcel_read_int64 = nullptr;
+  FnAParcelWriteInt64 parcel_write_int64 = nullptr;
+  FnAParcelReadParcelFileDescriptor parcel_read_fd = nullptr;
+  FnAParcelWriteParcelFileDescriptor parcel_write_fd = nullptr;
   FnAParcelReadByteArray parcel_read_byte_array = nullptr;
   FnAParcelWriteByteArray parcel_write_byte_array = nullptr;
 };

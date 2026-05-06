@@ -1,20 +1,27 @@
 #include "video2camera_service.h"
-#include "video2camera_player.h"
 
 #include <android/binder_ibinder.h>
 #include <android/binder_parcel.h>
 #include <android/log.h>
 #include <dlfcn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
 #include <mutex>
-#include <string>
 #include <vector>
 
-#include "ready_frame_cache.h"
 #include "video2camera_ipc.h"
 #include "video2camera_ndk.h"
+#include "ready_frame_cache.h"
 
 #define LOG_TAG "awesomeCAM"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -24,21 +31,41 @@
 namespace awesomecam {
 namespace {
 
-struct IncomingByteArray {
-  std::vector<int8_t> data;
+struct TargetStore {
+  std::mutex mutex;
+  std::vector<VideoTargetState> targets;
+  uint64_t next_generation = 0;
 };
 
-struct SharedFrameState {
-  std::mutex mutex;
+struct SharedMemoryMapping {
+  void *addr = nullptr;
+  size_t size = 0;
   int32_t width = 0;
   int32_t height = 0;
-  int32_t format = kFrameFormatUnknown;
-  std::vector<uint8_t> bytes;
-  uint64_t generation = 0;
-  uint64_t push_count = 0;
+  int32_t frame_format = kFrameFormatUnknown;
+  uint32_t slot_count = 0;
+  uint32_t slot_size = 0;
+  uint64_t registration_generation = 0;
+
+  ~SharedMemoryMapping() {
+    if (addr != nullptr && addr != MAP_FAILED && size > 0) {
+      munmap(addr, size);
+    }
+  }
+
+  SharedMemoryRingHeader *header() const {
+    return reinterpret_cast<SharedMemoryRingHeader *>(addr);
+  }
 };
 
-SharedFrameState g_shared_frame;
+struct SharedMemoryStore {
+  std::mutex mutex;
+  std::shared_ptr<SharedMemoryMapping> source;
+  uint64_t registration_generation = 0;
+};
+
+TargetStore g_target_store;
+SharedMemoryStore g_memory_store;
 BinderRuntimeApi g_binder_runtime;
 std::atomic<bool> g_service_started{false};
 std::atomic<bool> g_service_registered{false};
@@ -64,9 +91,54 @@ struct OpaqueStrongPointer {
   void *ptr = nullptr;
 };
 
+constexpr uint64_t kNsPerSecond = 1000000000ULL;
+constexpr uint64_t kTargetTtlNs = 5ULL * kNsPerSecond;
+constexpr size_t kMaxTrackedTargets = 16;
+constexpr int32_t kHalPixelFormatImplementationDefined = 0x22;
+constexpr int32_t kHalPixelFormatYcbcr420888 = 0x23;
+
 using FnProcessStateStartThreadPool = void (*)(void *);
 using FnIPCThreadStateSelf = void *(*)();
 using FnIPCThreadStateJoinThreadPool = void (*)(void *, bool);
+
+template <typename T>
+T AtomicLoadAcquire(const T *ptr) {
+  T value{};
+  __atomic_load(ptr, &value, __ATOMIC_ACQUIRE);
+  return value;
+}
+
+uint64_t MonotonicNs() {
+  timespec ts{};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * kNsPerSecond +
+         static_cast<uint64_t>(ts.tv_nsec);
+}
+
+bool IsSupportedTargetFormat(int32_t format) {
+  return format == kHalPixelFormatYcbcr420888 ||
+         format == kHalPixelFormatImplementationDefined;
+}
+
+bool SameTargetKey(const VideoTargetState &target, int32_t width, int32_t height,
+                   int32_t format) {
+  return target.width == width && target.height == height && target.format == format;
+}
+
+void PruneExpiredTargetsLocked(uint64_t now_ns) {
+  auto &targets = g_target_store.targets;
+  const size_t before = targets.size();
+  targets.erase(std::remove_if(targets.begin(), targets.end(),
+                               [&](const VideoTargetState &target) {
+                                 return target.last_seen_ns != 0 && now_ns > target.last_seen_ns &&
+                                        now_ns - target.last_seen_ns > kTargetTtlNs;
+                               }),
+                targets.end());
+  if (targets.size() != before) {
+    LOGI("Video2CameraService expired %zu inactive target(s), active=%zu",
+         before - targets.size(), targets.size());
+  }
+}
 
 bool LoadClassicBinderRuntimeApi(ClassicBinderRuntimeApi *api) {
   if (api == nullptr) return false;
@@ -78,13 +150,16 @@ bool LoadClassicBinderRuntimeApi(ClassicBinderRuntimeApi *api) {
   }
   api->handle = dlopen("libbinder.so", RTLD_NOW | RTLD_LOCAL);
   if (api->handle == nullptr) {
-    LOGE("ClassicBinder: dlopen(libbinder.so) failed: %s", dlerror() ? dlerror() : "unknown");
+    LOGE("ClassicBinder: dlopen(libbinder.so) failed: %s",
+         dlerror() ? dlerror() : "unknown");
     return false;
   }
   api->sym_process_state_self = dlsym(api->handle, "_ZN7android12ProcessState4selfEv");
-  api->sym_process_state_start_thread_pool = dlsym(api->handle, "_ZN7android12ProcessState15startThreadPoolEv");
+  api->sym_process_state_start_thread_pool =
+      dlsym(api->handle, "_ZN7android12ProcessState15startThreadPoolEv");
   api->sym_ipc_thread_state_self = dlsym(api->handle, "_ZN7android14IPCThreadState4selfEv");
-  api->sym_ipc_thread_state_join_thread_pool = dlsym(api->handle, "_ZN7android14IPCThreadState14joinThreadPoolEb");
+  api->sym_ipc_thread_state_join_thread_pool =
+      dlsym(api->handle, "_ZN7android14IPCThreadState14joinThreadPoolEb");
   const bool ok = api->sym_process_state_self != nullptr &&
                   api->sym_process_state_start_thread_pool != nullptr &&
                   api->sym_ipc_thread_state_self != nullptr &&
@@ -144,105 +219,165 @@ void StartClassicBinderThreadPool() {
   LOGI("ClassicBinder: IPCThreadState::joinThreadPool() returned");
 }
 
-
-bool ByteArrayAllocator(void *arrayData, int32_t length, int8_t **outBuffer) {
-  if (arrayData == nullptr || outBuffer == nullptr) return false;
-  auto *incoming = static_cast<IncomingByteArray *>(arrayData);
-  if (length < 0) {
-    incoming->data.clear();
-    *outBuffer = nullptr;
-    return true;
+bool ValidateSharedMemoryHeader(const SharedMemoryRingHeader *header, int32_t width,
+                                int32_t height, int32_t format, uint32_t slot_count,
+                                uint32_t slot_size, size_t region_size) {
+  if (header == nullptr) return false;
+  if (header->magic != kSharedMemoryRingMagic ||
+      header->version != kSharedMemoryRingVersion ||
+      header->header_size != sizeof(SharedMemoryRingHeader) ||
+      header->slot_count != slot_count || header->slot_count != kSharedMemoryRingSlotCount ||
+      header->width != width || header->height != height || header->format != format ||
+      header->format != kFrameFormatI420 || header->slot_size != slot_size) {
+    return false;
   }
-  incoming->data.resize(static_cast<size_t>(length));
-  *outBuffer = incoming->data.empty() ? nullptr : incoming->data.data();
+  const size_t expected_slot_size = I420FrameSize(width, height);
+  const size_t expected_region_size = SharedMemoryRingSize(width, height);
+  return expected_slot_size == slot_size && expected_region_size <= region_size;
+}
+
+bool RegisterSourceMemoryFromFd(int fd, int32_t width, int32_t height,
+                                int32_t frame_format, uint32_t slot_count,
+                                uint32_t slot_size, size_t region_size) {
+  if (fd < 0 || width <= 0 || height <= 0 || frame_format != kFrameFormatI420 ||
+      slot_count != kSharedMemoryRingSlotCount || slot_size == 0 || region_size == 0) {
+    LOGW("Video2CameraService reject source fd=%d src=%dx%d frameFmt=%d slots=%u slot=%u region=%zu",
+         fd, width, height, frame_format, slot_count, slot_size, region_size);
+    return false;
+  }
+
+  struct stat st {};
+  if (fstat(fd, &st) == 0 && st.st_size > 0 && static_cast<size_t>(st.st_size) < region_size) {
+    LOGW("Video2CameraService reject source fd size=%lld region=%zu",
+         static_cast<long long>(st.st_size), region_size);
+    return false;
+  }
+
+  void *addr = mmap(nullptr, region_size, PROT_READ, MAP_SHARED, fd, 0);
+  if (addr == MAP_FAILED) {
+    LOGE("Video2CameraService mmap source failed errno=%d (%s)", errno, strerror(errno));
+    return false;
+  }
+
+  auto *header = reinterpret_cast<SharedMemoryRingHeader *>(addr);
+  if (!ValidateSharedMemoryHeader(header, width, height, frame_format, slot_count, slot_size,
+                                  region_size)) {
+    LOGW("Video2CameraService reject source header magic=%#x ver=%u hdr=%u %dx%d fmt=%d slots=%u slot=%u latest=%llu region=%zu",
+         header->magic, header->version, header->header_size, header->width,
+         header->height, header->format, header->slot_count, header->slot_size,
+         static_cast<unsigned long long>(header->latest_generation), region_size);
+    munmap(addr, region_size);
+    return false;
+  }
+
+  auto mapping = std::make_shared<SharedMemoryMapping>();
+  mapping->addr = addr;
+  mapping->size = region_size;
+  mapping->width = width;
+  mapping->height = height;
+  mapping->frame_format = frame_format;
+  mapping->slot_count = slot_count;
+  mapping->slot_size = slot_size;
+  {
+    std::lock_guard<std::mutex> lock(g_memory_store.mutex);
+    mapping->registration_generation = ++g_memory_store.registration_generation;
+    g_memory_store.source = mapping;
+  }
+
+  LOGI("Video2CameraService source ring registered regGen=%llu src=%dx%d frameFmt=%d slots=%u slot=%u region=%zu addr=%p",
+       static_cast<unsigned long long>(mapping->registration_generation), width, height,
+       frame_format, slot_count, slot_size, region_size, addr);
   return true;
+}
+
+void ClearSharedMemoryRegistrationLocked() {
+  g_memory_store.source.reset();
+  g_memory_store.registration_generation += 1;
 }
 
 void *OnCreate(void *) { return nullptr; }
 void OnDestroy(void *) {}
 
+binder_status_t WriteTargetsToParcel(AParcel *out) {
+  std::vector<VideoTargetState> targets;
+  GetVideo2CameraTargets(&targets);
+  binder_status_t status =
+      g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(targets.size()));
+  for (const VideoTargetState &target : targets) {
+    if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int32(out, target.width);
+    if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int32(out, target.height);
+    if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int32(out, target.format);
+    if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int64(out, static_cast<int64_t>(target.generation));
+    if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int64(out, static_cast<int64_t>(target.last_seen_ns));
+    if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int64(out, static_cast<int64_t>(target.hit_count));
+    if (status != STATUS_OK) break;
+  }
+  return status;
+}
+
+binder_status_t WriteSourceStatusToParcel(AParcel *out) {
+  SourceFrameStatus state{};
+  GetSourceFrameStatus(&state);
+  binder_status_t status = g_binder_runtime.parcel_write_int32(out, state.width);
+  if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int32(out, state.height);
+  if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int32(out, state.format);
+  if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int64(out, static_cast<int64_t>(state.generation));
+  if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(state.slot));
+  if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int64(out, state.pts_us);
+  if (status == STATUS_OK) status = g_binder_runtime.parcel_write_int64(out, static_cast<int64_t>(state.registration_generation));
+  return status;
+}
+
 binder_status_t OnTransact(AIBinder *, transaction_code_t code, const AParcel *in,
                            AParcel *out) {
   switch (code) {
-    case kTxnSetFrame: {
+    case kTxnGetTargets: {
+      if (out == nullptr) return STATUS_BAD_VALUE;
+      return WriteTargetsToParcel(out);
+    }
+    case kTxnRegisterSourceMemory: {
+      int fd = -1;
       int32_t width = 0;
       int32_t height = 0;
-      int32_t format = 0;
-      binder_status_t status = g_binder_runtime.parcel_read_int32(in, &width);
-      if (status != STATUS_OK) return status;
-      status = g_binder_runtime.parcel_read_int32(in, &height);
-      if (status != STATUS_OK) return status;
-      status = g_binder_runtime.parcel_read_int32(in, &format);
-      if (status != STATUS_OK) return status;
-
-      IncomingByteArray incoming;
-      status = g_binder_runtime.parcel_read_byte_array(in, &incoming, ByteArrayAllocator);
-      if (status != STATUS_OK) return status;
-
-      if (width <= 0 || height <= 0 || format != kFrameFormatI420) {
-        LOGW("Video2CameraService reject frame width=%d height=%d format=%d size=%zu",
-             width, height, format, incoming.data.size());
-        return STATUS_BAD_VALUE;
+      int32_t frame_format = 0;
+      int32_t slot_count_i32 = 0;
+      int32_t slot_size_i32 = 0;
+      int64_t region_size_i64 = 0;
+      binder_status_t status = g_binder_runtime.parcel_read_fd(in, &fd);
+      if (status == STATUS_OK) status = g_binder_runtime.parcel_read_int32(in, &width);
+      if (status == STATUS_OK) status = g_binder_runtime.parcel_read_int32(in, &height);
+      if (status == STATUS_OK) status = g_binder_runtime.parcel_read_int32(in, &frame_format);
+      if (status == STATUS_OK) status = g_binder_runtime.parcel_read_int32(in, &slot_count_i32);
+      if (status == STATUS_OK) status = g_binder_runtime.parcel_read_int32(in, &slot_size_i32);
+      if (status == STATUS_OK) status = g_binder_runtime.parcel_read_int64(in, &region_size_i64);
+      if (status != STATUS_OK) {
+        if (fd >= 0) close(fd);
+        return status;
       }
-
-      const size_t expected = static_cast<size_t>(width) * height * 3 / 2;
-      if (incoming.data.size() < expected) {
-        LOGW("Video2CameraService frame too small size=%zu expected=%zu", incoming.data.size(),
-             expected);
-        return STATUS_BAD_VALUE;
-      }
-
-      StopNativePlayback();
-      PublishDecodedI420Frame(
-          width, height,
-          std::vector<uint8_t>(reinterpret_cast<const uint8_t *>(incoming.data.data()),
-                               reinterpret_cast<const uint8_t *>(incoming.data.data()) + expected));
-      if (out != nullptr) {
-        BinderFrameState state{};
-        if (PeekLatestBinderFrameState(&state)) {
-          g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(state.generation));
-        }
-      }
+      const bool ok = RegisterSourceMemoryFromFd(
+          fd, width, height, frame_format, static_cast<uint32_t>(slot_count_i32),
+          static_cast<uint32_t>(slot_size_i32),
+          region_size_i64 > 0 ? static_cast<size_t>(region_size_i64) : 0u);
+      if (fd >= 0) close(fd);
+      if (!ok) return STATUS_BAD_VALUE;
+      if (out != nullptr) g_binder_runtime.parcel_write_int32(out, 1);
       return STATUS_OK;
     }
-    case kTxnClearFrame: {
-      StopNativePlayback();
-      ClearLatestBinderFrame();
-      if (out != nullptr) {
-        BinderFrameState state{};
-        if (PeekLatestBinderFrameState(&state)) {
-          g_binder_runtime.parcel_write_int32(out, static_cast<int32_t>(state.generation));
-        } else {
-          g_binder_runtime.parcel_write_int32(out, 0);
-        }
-      }
-      LOGI("Video2CameraService cleared cached frame");
+    case kTxnUnregisterSourceMemory: {
+      ClearSharedMemoryRegistration();
+      if (out != nullptr) g_binder_runtime.parcel_write_int32(out, 1);
+      LOGI("Video2CameraService source ring unregistered");
       return STATUS_OK;
     }
-    case kTxnPlayFile: {
-      IncomingByteArray incoming;
-      binder_status_t status = g_binder_runtime.parcel_read_byte_array(in, &incoming, ByteArrayAllocator);
-      if (status != STATUS_OK) return status;
-      std::string path(incoming.data.begin(), incoming.data.end());
-      if (path.empty()) return STATUS_BAD_VALUE;
-      std::string error;
-      if (!StartNativePlayback(path, &error)) {
-        LOGE("Video2CameraService play failed for %s: %s", path.c_str(), error.c_str());
-        return STATUS_UNKNOWN_ERROR;
-      }
-      LOGI("Video2CameraService native playback started path=%s", path.c_str());
-      if (out != nullptr) {
-        g_binder_runtime.parcel_write_int32(out, 1);
-      }
+    case kTxnClear: {
+      ClearSharedMemoryRegistration();
+      if (out != nullptr) g_binder_runtime.parcel_write_int32(out, 1);
+      LOGI("Video2CameraService cleared source registration");
       return STATUS_OK;
     }
-    case kTxnStopPlayback: {
-      StopNativePlayback();
-      if (out != nullptr) {
-        g_binder_runtime.parcel_write_int32(out, 1);
-      }
-      LOGI("Video2CameraService native playback stopped");
-      return STATUS_OK;
+    case kTxnGetSourceStatus: {
+      if (out == nullptr) return STATUS_BAD_VALUE;
+      return WriteSourceStatusToParcel(out);
     }
     default:
       return STATUS_UNKNOWN_TRANSACTION;
@@ -258,28 +393,160 @@ bool EnsureServiceClass() {
 
 }  // namespace
 
-void PublishDecodedI420Frame(int32_t width, int32_t height, std::vector<uint8_t> &&bytes) {
-  if (width <= 0 || height <= 0 || bytes.empty()) return;
-  uint64_t generation = 0;
-  {
-    std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
-    generation = g_shared_frame.generation + 1;
+void UpdateVideo2CameraTarget(int32_t width, int32_t height, int32_t format) {
+  if (width <= 0 || height <= 0 || !IsSupportedTargetFormat(format)) return;
+  const uint64_t now_ns = MonotonicNs();
+  std::lock_guard<std::mutex> lock(g_target_store.mutex);
+  PruneExpiredTargetsLocked(now_ns);
+  for (VideoTargetState &target : g_target_store.targets) {
+    if (!SameTargetKey(target, width, height, format)) continue;
+    target.last_seen_ns = now_ns;
+    target.hit_count += 1;
+    if (target.hit_count <= 5 || (target.hit_count % 120) == 0) {
+      LOGI("Video2CameraService target hit gen=%llu %dx%d fmt=%#x hits=%llu",
+           static_cast<unsigned long long>(target.generation), width, height, format,
+           static_cast<unsigned long long>(target.hit_count));
+    }
+    return;
   }
-  PublishReadyI420Source(width, height, bytes, generation);
 
-  std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
-  g_shared_frame.width = width;
-  g_shared_frame.height = height;
-  g_shared_frame.format = kFrameFormatI420;
-  g_shared_frame.bytes = std::move(bytes);
-  g_shared_frame.generation = generation;
-  g_shared_frame.push_count += 1;
-  if (g_shared_frame.push_count <= 5 || (g_shared_frame.push_count % 120) == 0) {
-    LOGI("Video2CameraService publish decoded frame #%llu %dx%d bytes=%zu gen=%llu",
-         static_cast<unsigned long long>(g_shared_frame.push_count), width, height,
-         g_shared_frame.bytes.size(),
-         static_cast<unsigned long long>(g_shared_frame.generation));
+  if (g_target_store.targets.size() >= kMaxTrackedTargets) {
+    auto oldest = std::min_element(
+        g_target_store.targets.begin(), g_target_store.targets.end(),
+        [](const VideoTargetState &a, const VideoTargetState &b) {
+          return a.last_seen_ns < b.last_seen_ns;
+        });
+    if (oldest != g_target_store.targets.end()) {
+      LOGI("Video2CameraService dropping oldest target gen=%llu %dx%d fmt=%#x",
+           static_cast<unsigned long long>(oldest->generation), oldest->width,
+           oldest->height, oldest->format);
+      g_target_store.targets.erase(oldest);
+    }
   }
+
+  VideoTargetState state{};
+  state.width = width;
+  state.height = height;
+  state.format = format;
+  state.generation = ++g_target_store.next_generation;
+  state.last_seen_ns = now_ns;
+  state.hit_count = 1;
+  g_target_store.targets.push_back(state);
+  LOGI("Video2CameraService target active gen=%llu %dx%d fmt=%#x",
+       static_cast<unsigned long long>(state.generation), width, height, format);
+}
+
+bool PeekVideo2CameraTarget(VideoTargetState *out) {
+  if (out == nullptr) return false;
+  std::lock_guard<std::mutex> lock(g_target_store.mutex);
+  PruneExpiredTargetsLocked(MonotonicNs());
+  if (g_target_store.targets.empty()) {
+    *out = VideoTargetState{};
+    return false;
+  }
+  auto latest = std::max_element(
+      g_target_store.targets.begin(), g_target_store.targets.end(),
+      [](const VideoTargetState &a, const VideoTargetState &b) {
+        return a.last_seen_ns < b.last_seen_ns;
+      });
+  *out = latest != g_target_store.targets.end() ? *latest : VideoTargetState{};
+  return out->width > 0 && out->height > 0;
+}
+
+bool GetVideo2CameraTargets(std::vector<VideoTargetState> *out) {
+  if (out == nullptr) return false;
+  std::lock_guard<std::mutex> lock(g_target_store.mutex);
+  PruneExpiredTargetsLocked(MonotonicNs());
+  *out = g_target_store.targets;
+  std::sort(out->begin(), out->end(),
+            [](const VideoTargetState &a, const VideoTargetState &b) {
+              if (a.last_seen_ns != b.last_seen_ns) return a.last_seen_ns > b.last_seen_ns;
+              const int64_t area_a = static_cast<int64_t>(a.width) * a.height;
+              const int64_t area_b = static_cast<int64_t>(b.width) * b.height;
+              return area_a > area_b;
+            });
+  return !out->empty();
+}
+
+bool CopyLatestSourceFrame(SharedMemoryFrameView *out) {
+  if (out == nullptr) return false;
+  *out = SharedMemoryFrameView{};
+
+  std::shared_ptr<SharedMemoryMapping> mapping;
+  {
+    std::lock_guard<std::mutex> lock(g_memory_store.mutex);
+    mapping = g_memory_store.source;
+  }
+  if (!mapping || mapping->frame_format != kFrameFormatI420) return false;
+
+  const auto *header = mapping->header();
+  if (!ValidateSharedMemoryHeader(header, mapping->width, mapping->height,
+                                  mapping->frame_format, mapping->slot_count,
+                                  mapping->slot_size, mapping->size)) {
+    return false;
+  }
+
+  const uint64_t generation = AtomicLoadAcquire(&header->latest_generation);
+  const uint32_t slot_index = AtomicLoadAcquire(&header->latest_slot);
+  if (generation == 0 || slot_index >= header->slot_count || slot_index == kSharedMemoryNoSlot) {
+    return false;
+  }
+
+  const SharedMemoryRingSlot &slot = header->slots[slot_index];
+  const uint64_t begin_generation = AtomicLoadAcquire(&slot.begin_generation);
+  const uint64_t end_generation = AtomicLoadAcquire(&slot.end_generation);
+  const uint32_t data_offset = AtomicLoadAcquire(&slot.data_offset);
+  const uint32_t data_size = AtomicLoadAcquire(&slot.data_size);
+  const int64_t pts_us = AtomicLoadAcquire(&slot.pts_us);
+  const size_t expected_size = I420FrameSize(mapping->width, mapping->height);
+
+  if (begin_generation != generation || end_generation != generation ||
+      data_size < expected_size || data_offset > mapping->size ||
+      expected_size > mapping->size - data_offset) {
+    return false;
+  }
+
+  out->bytes = static_cast<const uint8_t *>(mapping->addr) + data_offset;
+  out->size = expected_size;
+  out->width = mapping->width;
+  out->height = mapping->height;
+  out->format = kFrameFormatI420;
+  out->generation = generation;
+  out->slot = slot_index;
+  out->pts_us = pts_us;
+  out->keepalive = mapping;
+  return true;
+}
+
+bool GetSourceFrameStatus(SourceFrameStatus *out) {
+  if (out == nullptr) return false;
+  *out = SourceFrameStatus{};
+  std::shared_ptr<SharedMemoryMapping> mapping;
+  {
+    std::lock_guard<std::mutex> lock(g_memory_store.mutex);
+    mapping = g_memory_store.source;
+    out->registration_generation = g_memory_store.registration_generation;
+  }
+  if (!mapping) return false;
+  out->width = mapping->width;
+  out->height = mapping->height;
+  out->format = mapping->frame_format;
+  out->registration_generation = mapping->registration_generation;
+  const auto *header = mapping->header();
+  out->generation = AtomicLoadAcquire(&header->latest_generation);
+  out->slot = AtomicLoadAcquire(&header->latest_slot);
+  if (out->generation != 0 && out->slot < mapping->slot_count) {
+    out->pts_us = AtomicLoadAcquire(&header->slots[out->slot].pts_us);
+  }
+  return true;
+}
+
+void ClearSharedMemoryRegistration() {
+  {
+    std::lock_guard<std::mutex> lock(g_memory_store.mutex);
+    ClearSharedMemoryRegistrationLocked();
+  }
+  ClearReadyFrameCache();
 }
 
 bool ProbeBinderRuntimeOnly() {
@@ -294,62 +561,24 @@ bool ProbeBinderRuntimeOnly() {
 
 bool ProbeBinderClassDefineOnly() {
   LOGI("Video2CameraService[C2]: loading binder runtime");
-  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
-    LOGE("Video2CameraService[C2]: failed to load binder runtime API");
-    return false;
-  }
-  LOGI("Video2CameraService[C2]: binder runtime loaded handle=%p", g_binder_runtime.handle);
+  if (!LoadBinderRuntimeApi(&g_binder_runtime)) return false;
   LOGI("Video2CameraService[C2]: defining binder class only");
-  if (!EnsureServiceClass()) {
-    LOGE("Video2CameraService[C2]: failed to define service class");
-    return false;
-  }
-  LOGI("Video2CameraService[C2]: binder class=%p", g_service_class);
-  return true;
+  return EnsureServiceClass();
 }
 
 bool ProbeBinderNewOnly() {
   LOGI("Video2CameraService[C3]: loading binder runtime");
-  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
-    LOGE("Video2CameraService[C3]: failed to load binder runtime API");
-    return false;
-  }
-  LOGI("Video2CameraService[C3]: binder runtime loaded handle=%p", g_binder_runtime.handle);
-  LOGI("Video2CameraService[C3]: ensuring binder class");
-  if (!EnsureServiceClass()) {
-    LOGE("Video2CameraService[C3]: failed to define service class");
-    return false;
-  }
-  LOGI("Video2CameraService[C3]: creating binder instance only");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime) || !EnsureServiceClass()) return false;
   AIBinder *binder = g_binder_runtime.binder_new(g_service_class, nullptr);
-  if (binder == nullptr) {
-    LOGE("Video2CameraService[C3]: AIBinder_new failed");
-    return false;
-  }
   LOGI("Video2CameraService[C3]: binder instance=%p", binder);
-  return true;
+  return binder != nullptr;
 }
 
 bool ProbeBinderThreadPoolOnly() {
   LOGI("Video2CameraService[C4]: loading binder runtime");
-  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
-    LOGE("Video2CameraService[C4]: failed to load binder runtime API");
-    return false;
-  }
-  LOGI("Video2CameraService[C4]: binder runtime loaded handle=%p", g_binder_runtime.handle);
-  LOGI("Video2CameraService[C4]: ensuring binder class");
-  if (!EnsureServiceClass()) {
-    LOGE("Video2CameraService[C4]: failed to define service class");
-    return false;
-  }
-  LOGI("Video2CameraService[C4]: creating binder instance");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime) || !EnsureServiceClass()) return false;
   AIBinder *binder = g_binder_runtime.binder_new(g_service_class, nullptr);
-  if (binder == nullptr) {
-    LOGE("Video2CameraService[C4]: AIBinder_new failed");
-    return false;
-  }
-  LOGI("Video2CameraService[C4]: binder instance=%p", binder);
-  LOGI("Video2CameraService[C4]: starting binder threadpool only");
+  if (binder == nullptr) return false;
   g_binder_runtime.set_thread_pool_max(1);
   g_binder_runtime.start_thread_pool();
   LOGI("Video2CameraService[C4]: binder threadpool started");
@@ -359,143 +588,62 @@ bool ProbeBinderThreadPoolOnly() {
 namespace {
 void *ProbeC51WorkerMain(void *) {
   LOGI("Video2CameraService[C51]: worker start");
-  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
-    LOGE("Video2CameraService[C51]: failed to load binder runtime API");
-    g_probe_c51_launching.store(false);
-    return nullptr;
+  if (LoadBinderRuntimeApi(&g_binder_runtime) && EnsureServiceClass()) {
+    AIBinder *binder = g_binder_runtime.binder_new(g_service_class, nullptr);
+    LOGI("Video2CameraService[C51]: binder instance=%p", binder);
+    g_binder_runtime.set_thread_pool_max(1);
+    g_binder_runtime.start_thread_pool();
+    LOGI("Video2CameraService[C51]: binder threadpool started");
   }
-  LOGI("Video2CameraService[C51]: binder runtime loaded handle=%p", g_binder_runtime.handle);
-  if (!EnsureServiceClass()) {
-    LOGE("Video2CameraService[C51]: failed to define service class");
-    g_probe_c51_launching.store(false);
-    return nullptr;
-  }
-  LOGI("Video2CameraService[C51]: creating binder instance");
-  AIBinder *binder = g_binder_runtime.binder_new(g_service_class, nullptr);
-  if (binder == nullptr) {
-    LOGE("Video2CameraService[C51]: AIBinder_new failed");
-    g_probe_c51_launching.store(false);
-    return nullptr;
-  }
-  LOGI("Video2CameraService[C51]: binder instance=%p", binder);
-  LOGI("Video2CameraService[C51]: starting binder threadpool from worker");
-  g_binder_runtime.set_thread_pool_max(1);
-  g_binder_runtime.start_thread_pool();
-  LOGI("Video2CameraService[C51]: binder threadpool started");
   g_probe_c51_launching.store(false);
   return nullptr;
 }
 
 void *ProbeC52WorkerMain(void *) {
   LOGI("Video2CameraService[C52]: worker start");
-  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
-    LOGE("Video2CameraService[C52]: failed to load binder runtime API");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime) || !EnsureServiceClass()) {
     g_probe_c52_launching.store(false);
     return nullptr;
   }
-  LOGI("Video2CameraService[C52]: binder runtime loaded handle=%p", g_binder_runtime.handle);
-  if (!EnsureServiceClass()) {
-    LOGE("Video2CameraService[C52]: failed to define service class");
-    g_probe_c52_launching.store(false);
-    return nullptr;
-  }
-  LOGI("Video2CameraService[C52]: creating binder instance");
   g_service_binder = g_binder_runtime.binder_new(g_service_class, nullptr);
   if (g_service_binder == nullptr) {
-    LOGE("Video2CameraService[C52]: AIBinder_new failed");
     g_probe_c52_launching.store(false);
     return nullptr;
   }
-  LOGI("Video2CameraService[C52]: binder instance=%p", g_service_binder);
-  LOGI("Video2CameraService[C52]: starting binder threadpool from worker");
   g_binder_runtime.set_thread_pool_max(1);
   g_binder_runtime.start_thread_pool();
-  LOGI("Video2CameraService[C52]: binder threadpool started");
-  LOGI("Video2CameraService[C52]: adding service %s", kVideo2CameraServiceName);
   const binder_status_t add_status =
       g_binder_runtime.add_service(g_service_binder, kVideo2CameraServiceName);
-  if (add_status != STATUS_OK) {
+  if (add_status == STATUS_OK) {
+    g_service_registered.store(true);
+    LOGI("Video2CameraService[C52]: registered as %s", kVideo2CameraServiceName);
+  } else {
     LOGE("Video2CameraService[C52]: add_service failed status=%d", add_status);
-    g_probe_c52_launching.store(false);
-    return nullptr;
   }
-  g_service_registered.store(true);
-  LOGI("Video2CameraService[C52]: registered as %s", kVideo2CameraServiceName);
   g_probe_c52_launching.store(false);
   return nullptr;
 }
-}  // namespace
 
-bool ProbeBinderThreadPoolWorkerOnly() {
-  bool expected = false;
-  if (!g_probe_c51_launching.compare_exchange_strong(expected, true)) {
-    LOGW("Video2CameraService[C51]: worker already launching");
-    return true;
-  }
-  pthread_t thread;
-  const int rc = pthread_create(&thread, nullptr, ProbeC51WorkerMain, nullptr);
-  if (rc != 0) {
-    LOGE("Video2CameraService[C51]: pthread_create failed rc=%d", rc);
-    g_probe_c51_launching.store(false);
-    return false;
-  }
-  pthread_detach(thread);
-  LOGI("Video2CameraService[C51]: worker launched");
-  return true;
-}
-
-bool ProbeBinderFullServiceWorkerAsync() {
-  bool expected = false;
-  if (!g_probe_c52_launching.compare_exchange_strong(expected, true)) {
-    LOGW("Video2CameraService[C52]: worker already launching");
-    return true;
-  }
-  pthread_t thread;
-  const int rc = pthread_create(&thread, nullptr, ProbeC52WorkerMain, nullptr);
-  if (rc != 0) {
-    LOGE("Video2CameraService[C52]: pthread_create failed rc=%d", rc);
-    g_probe_c52_launching.store(false);
-    return false;
-  }
-  pthread_detach(thread);
-  LOGI("Video2CameraService[C52]: worker launched");
-  return true;
-}
-
-namespace {
 void *ProbeC61WorkerMain(void *) {
   LOGI("Video2CameraService[C61]: worker start");
-  if (!LoadClassicBinderRuntimeApi(&g_classic_binder_runtime)) {
-    LOGE("Video2CameraService[C61]: failed to load classic binder runtime");
-    g_probe_c61_launching.store(false);
-    return nullptr;
+  if (LoadClassicBinderRuntimeApi(&g_classic_binder_runtime)) {
+    StartClassicBinderThreadPool();
   }
-  LOGI("Video2CameraService[C61]: classic binder runtime loaded handle=%p",
-       g_classic_binder_runtime.handle);
-  StartClassicBinderThreadPool();
   g_probe_c61_launching.store(false);
   return nullptr;
 }
 
 void *ProbeC62WorkerMain(void *) {
   LOGI("Video2CameraService[C62]: worker start");
-  if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
-    LOGE("Video2CameraService[C62]: failed to load binder runtime API");
-    g_probe_c62_launching.store(false);
-    return nullptr;
-  }
-  if (!EnsureServiceClass()) {
-    LOGE("Video2CameraService[C62]: failed to define service class");
+  if (!LoadBinderRuntimeApi(&g_binder_runtime) || !EnsureServiceClass()) {
     g_probe_c62_launching.store(false);
     return nullptr;
   }
   g_service_binder = g_binder_runtime.binder_new(g_service_class, nullptr);
   if (g_service_binder == nullptr) {
-    LOGE("Video2CameraService[C62]: AIBinder_new failed");
     g_probe_c62_launching.store(false);
     return nullptr;
   }
-  LOGI("Video2CameraService[C62]: binder instance=%p", g_service_binder);
   const binder_status_t add_status =
       g_binder_runtime.add_service(g_service_binder, kVideo2CameraServiceName);
   if (add_status != STATUS_OK) {
@@ -505,53 +653,50 @@ void *ProbeC62WorkerMain(void *) {
   }
   g_service_registered.store(true);
   LOGI("Video2CameraService[C62]: registered as %s", kVideo2CameraServiceName);
-  if (!LoadClassicBinderRuntimeApi(&g_classic_binder_runtime)) {
-    LOGE("Video2CameraService[C62]: failed to load classic binder runtime");
-    g_probe_c62_launching.store(false);
-    return nullptr;
+  if (LoadClassicBinderRuntimeApi(&g_classic_binder_runtime)) {
+    StartClassicBinderThreadPool();
   }
-  LOGI("Video2CameraService[C62]: classic binder runtime loaded handle=%p",
-       g_classic_binder_runtime.handle);
-  StartClassicBinderThreadPool();
   g_probe_c62_launching.store(false);
   return nullptr;
 }
-}  // namespace
 
-bool ProbeClassicThreadPoolWorkerOnly() {
+bool LaunchDetachedWorker(std::atomic<bool> *flag, void *(*fn)(void *), const char *name) {
   bool expected = false;
-  if (!g_probe_c61_launching.compare_exchange_strong(expected, true)) {
-    LOGW("Video2CameraService[C61]: worker already launching");
+  if (!flag->compare_exchange_strong(expected, true)) {
+    LOGW("%s: worker already launching", name);
     return true;
   }
   pthread_t thread;
-  const int rc = pthread_create(&thread, nullptr, ProbeC61WorkerMain, nullptr);
+  const int rc = pthread_create(&thread, nullptr, fn, nullptr);
   if (rc != 0) {
-    LOGE("Video2CameraService[C61]: pthread_create failed rc=%d", rc);
-    g_probe_c61_launching.store(false);
+    LOGE("%s: pthread_create failed rc=%d", name, rc);
+    flag->store(false);
     return false;
   }
   pthread_detach(thread);
-  LOGI("Video2CameraService[C61]: worker launched");
+  LOGI("%s: worker launched", name);
   return true;
+}
+}  // namespace
+
+bool ProbeBinderThreadPoolWorkerOnly() {
+  return LaunchDetachedWorker(&g_probe_c51_launching, ProbeC51WorkerMain,
+                              "Video2CameraService[C51]");
+}
+
+bool ProbeBinderFullServiceWorkerAsync() {
+  return LaunchDetachedWorker(&g_probe_c52_launching, ProbeC52WorkerMain,
+                              "Video2CameraService[C52]");
+}
+
+bool ProbeClassicThreadPoolWorkerOnly() {
+  return LaunchDetachedWorker(&g_probe_c61_launching, ProbeC61WorkerMain,
+                              "Video2CameraService[C61]");
 }
 
 bool ProbeClassicServiceWorkerAsync() {
-  bool expected = false;
-  if (!g_probe_c62_launching.compare_exchange_strong(expected, true)) {
-    LOGW("Video2CameraService[C62]: worker already launching");
-    return true;
-  }
-  pthread_t thread;
-  const int rc = pthread_create(&thread, nullptr, ProbeC62WorkerMain, nullptr);
-  if (rc != 0) {
-    LOGE("Video2CameraService[C62]: pthread_create failed rc=%d", rc);
-    g_probe_c62_launching.store(false);
-    return false;
-  }
-  pthread_detach(thread);
-  LOGI("Video2CameraService[C62]: worker launched");
-  return true;
+  return LaunchDetachedWorker(&g_probe_c62_launching, ProbeC62WorkerMain,
+                              "Video2CameraService[C62]");
 }
 
 bool EnsureVideo2CameraServiceStarted() {
@@ -570,27 +715,24 @@ bool EnsureVideo2CameraServiceStarted() {
   if (!LoadBinderRuntimeApi(&g_binder_runtime)) {
     return fail("Video2CameraService: failed to load binder runtime API");
   }
-  LOGI("Video2CameraService: defining binder class");
   if (!EnsureServiceClass()) {
     return fail("Video2CameraService: failed to define service class");
   }
 
-  LOGI("Video2CameraService: creating binder instance");
   g_service_binder = g_binder_runtime.binder_new(g_service_class, nullptr);
   if (g_service_binder == nullptr) {
     return fail("Video2CameraService: AIBinder_new failed");
   }
 
-  LOGI("Video2CameraService: starting binder threadpool");
   g_binder_runtime.set_thread_pool_max(1);
   g_binder_runtime.start_thread_pool();
 
-  LOGI("Video2CameraService: adding service %s", kVideo2CameraServiceName);
   const binder_status_t add_status =
       g_binder_runtime.add_service(g_service_binder, kVideo2CameraServiceName);
   if (add_status != STATUS_OK) {
     char buf[128];
-    snprintf(buf, sizeof(buf), "Video2CameraService: add_service failed status=%d", add_status);
+    snprintf(buf, sizeof(buf), "Video2CameraService: add_service failed status=%d",
+             add_status);
     return fail(buf);
   }
 
@@ -611,9 +753,7 @@ void StartVideo2CameraServiceAsync() {
   if (g_service_registered.load()) return;
 
   bool expected = false;
-  if (!g_service_launching.compare_exchange_strong(expected, true)) {
-    return;
-  }
+  if (!g_service_launching.compare_exchange_strong(expected, true)) return;
 
   pthread_t thread;
   const int rc = pthread_create(&thread, nullptr, ServiceThreadMain, nullptr);
@@ -624,45 +764,6 @@ void StartVideo2CameraServiceAsync() {
   }
   pthread_detach(thread);
   LOGI("Video2CameraService: async startup requested");
-}
-
-bool CopyLatestBinderFrame(BinderFrameCopy *out) {
-  if (out == nullptr) return false;
-  std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
-  if (g_shared_frame.width <= 0 || g_shared_frame.height <= 0 ||
-      g_shared_frame.format != kFrameFormatI420 || g_shared_frame.bytes.empty()) {
-    return false;
-  }
-  out->width = g_shared_frame.width;
-  out->height = g_shared_frame.height;
-  out->format = g_shared_frame.format;
-  out->generation = g_shared_frame.generation;
-  out->bytes = g_shared_frame.bytes;
-  return true;
-}
-
-bool PeekLatestBinderFrameState(BinderFrameState *out) {
-  if (out == nullptr) return false;
-  std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
-  if (g_shared_frame.width <= 0 || g_shared_frame.height <= 0 ||
-      g_shared_frame.format != kFrameFormatI420 || g_shared_frame.bytes.empty()) {
-    return false;
-  }
-  out->width = g_shared_frame.width;
-  out->height = g_shared_frame.height;
-  out->format = g_shared_frame.format;
-  out->generation = g_shared_frame.generation;
-  return true;
-}
-
-void ClearLatestBinderFrame() {
-  ClearReadyFrameCache();
-  std::lock_guard<std::mutex> lock(g_shared_frame.mutex);
-  g_shared_frame.width = 0;
-  g_shared_frame.height = 0;
-  g_shared_frame.format = kFrameFormatUnknown;
-  g_shared_frame.bytes.clear();
-  g_shared_frame.generation += 1;
 }
 
 }  // namespace awesomecam

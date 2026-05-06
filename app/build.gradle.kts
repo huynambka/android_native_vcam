@@ -37,7 +37,7 @@ android {
         versionName = "2.7"
         buildConfigField("String", "GIT_SHA", "\"${gitShortSha()}\"")
         buildConfigField("String", "BUILD_STAMP", "\"${buildStamp()}\"")
-        buildConfigField("String", "ARCH_LABEL", "\"surface-usage-cpu-write\"")
+        buildConfigField("String", "ARCH_LABEL", "\"ffmpeg-native-player\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a")
@@ -82,6 +82,7 @@ dependencies {
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
     implementation("com.bytedance.android:shadowhook:1.0.10")
+    implementation("io.github.yearsyan:ffmpeg-standard:7.1-beta.16")
 }
 
 tasks.register("buildDebug16kApk") {

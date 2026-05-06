@@ -15,7 +15,9 @@ bool LoadBinderRuntimeApi(BinderRuntimeApi *api) {
            api->binder_associate_class != nullptr && api->binder_is_alive != nullptr &&
            api->binder_prepare_transaction != nullptr && api->binder_transact != nullptr &&
            api->parcel_delete != nullptr && api->parcel_read_int32 != nullptr &&
-           api->parcel_write_int32 != nullptr && api->parcel_read_byte_array != nullptr &&
+           api->parcel_write_int32 != nullptr && api->parcel_read_int64 != nullptr &&
+           api->parcel_write_int64 != nullptr && api->parcel_read_fd != nullptr &&
+           api->parcel_write_fd != nullptr && api->parcel_read_byte_array != nullptr &&
            api->parcel_write_byte_array != nullptr;
   }
 
@@ -45,6 +47,10 @@ bool LoadBinderRuntimeApi(BinderRuntimeApi *api) {
   ok &= sym(api->parcel_delete, "AParcel_delete");
   ok &= sym(api->parcel_read_int32, "AParcel_readInt32");
   ok &= sym(api->parcel_write_int32, "AParcel_writeInt32");
+  ok &= sym(api->parcel_read_int64, "AParcel_readInt64");
+  ok &= sym(api->parcel_write_int64, "AParcel_writeInt64");
+  ok &= sym(api->parcel_read_fd, "AParcel_readParcelFileDescriptor");
+  ok &= sym(api->parcel_write_fd, "AParcel_writeParcelFileDescriptor");
   ok &= sym(api->parcel_read_byte_array, "AParcel_readByteArray");
   ok &= sym(api->parcel_write_byte_array, "AParcel_writeByteArray");
 
