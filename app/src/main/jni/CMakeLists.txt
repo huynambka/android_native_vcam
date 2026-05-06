@@ -57,6 +57,10 @@ target_include_directories(streamclient PRIVATE "${CMAKE_SOURCE_DIR}")
 target_include_directories(ffmpeg_packager PRIVATE "${CMAKE_SOURCE_DIR}")
 
 target_compile_options(injector_helper PRIVATE -ffunction-sections -fdata-sections -fno-exceptions -fno-rtti)
+target_compile_options(hook PRIVATE -O3)
+target_compile_options(awesomecam_player PRIVATE -O3)
+target_compile_definitions(hook PRIVATE NDEBUG)
+target_compile_definitions(awesomecam_player PRIVATE NDEBUG)
 target_link_options(injector_helper PRIVATE -Wl,--gc-sections -Wl,-z,max-page-size=16384)
 
 target_link_options(hook PRIVATE -Wl,-z,max-page-size=16384)
